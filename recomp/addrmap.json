@@ -1,0 +1,24 @@
+{
+  "_comment": "Фиксированная карта гостевых адресов. game.exe без .reloc — только на своей базе; остальные модули по возможности на предпочтительных базах, конфликтующие перенесены. Всё ниже 0x40000000, чтобы на Switch хватило окна в 1 ГБ.",
+  "window_size": "0x40000000",
+  "modules": {
+    "msvcr70.dll":  "0x13000000",
+    "Core.dll":     "0x10100000",
+    "Fire.dll":     "0x10500000",
+    "IpDrv.dll":    "0x10700000",
+    "game.exe":     "0x10900000",
+    "Window.dll":   "0x11000000",
+    "WinDrv.dll":   "0x11100000",
+    "Engine.dll":   "0x12000000",
+    "D3DDrv.dll":   "0x12800000",
+    "GUI.dll":      "0x12A00000",
+    "KWGame.dll":   "0x12B00000",
+    "ALAudio.dll":  "0x12C00000"
+  },
+  "regions": {
+    "runtime":   ["0x00010000", "0x00FFFFFF", "TEB/PEB, трамплины HLE-импортов, строки окружения"],
+    "low_alloc": ["0x01000000", "0x0FFFFFFF", "стеки потоков, VirtualAlloc"],
+    "images":    ["0x10000000", "0x1FFFFFFF", "образы модулей"],
+    "heap":      ["0x20000000", "0x3FFFFFFF", "HeapAlloc/VirtualAlloc"]
+  }
+}

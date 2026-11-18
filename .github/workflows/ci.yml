@@ -1,0 +1,41 @@
+name: Source checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Check publication contents and history
+        run: |
+          python3 -I tests/test_public.py
+          python3 -I tools/check_public.py --history
+      - name: Install build dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: brew install cmake ninja sdl2 libogg libvorbis ffmpeg freetype
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv tools/.venv
+          tools/.venv/bin/python -m pip install -r tools/requirements.txt
+      - name: Check Python sources and recompiler CLI
+        run: |
+          tools/.venv/bin/python -I -m compileall -q recomp tools/recon tools/probe tests tools/check_public.py tools/pgo_fetch.py tools/switch_upload.py
+          tools/.venv/bin/python -I recomp/main.py --help
+      - name: Build without game files
+        run: tools/build.sh mac
+      - name: Test runtime with synthetic data
+        run: ctest --test-dir build/mac --output-on-failure

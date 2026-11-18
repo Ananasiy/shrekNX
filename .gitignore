@@ -1,0 +1,52 @@
+# Данные игры и всё, что из них сгенерировано — НИКОГДА не коммитить
+/original/
+/game/
+/Shrek2RUS/
+/build/
+/shots/
+*.zip
+*.iso
+*.img
+# Локальные отчёты, трассы, профили и сборки
+/docs/recon/*.txt
+/nxlink*.txt
+/prof*.txt
+/gen/
+/generated/
+*.log
+*.nro
+*.nso
+*.elf
+*.nacp
+*.o
+*.a
+*.dylib
+*.gcda
+*.gcno
+*.dmp
+# Файлы игры вне стандартных каталогов тоже не должны попасть в git
+*.exe
+*.dll
+*.DLL
+*.u
+*.unr
+*.utx
+*.usx
+*.ukx
+*.uax
+*.Rus_uax
+*.bik
+*.ogg
+*.usa
+# Локальные настройки и ключи
+.env
+.env.*
+*.pem
+*.key
+# Инструменты/окружение
+/tools/.venv/
+/tools/ghidra/
+/tools/llvm/
+__pycache__/
+*.pyc
+.DS_Store
