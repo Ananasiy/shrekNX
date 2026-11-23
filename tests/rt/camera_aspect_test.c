@@ -57,7 +57,7 @@ static void mul_mat(float out[16], const float a[16], const float b[16])
 }
 
 // Заглушка FCameraSceneNode::UpdateMatrices (thiscall без аргументов: ret 0)
-static void mock_update_matrices(CPU *c)
+void mock_update_matrices_body(CPU *c)
 {
     u32 node = c->ecx;
     g_orig_calls++;
@@ -104,9 +104,40 @@ static void mock_update_matrices(CPU *c)
     c->esp += 4;
 }
 
-void (*const ovr_orig_ovr_engine_camera_matrices)(CPU *c) = mock_update_matrices;
-void (*const ovr_orig_ovr_engine_save_game)(CPU *c) = mock_update_matrices;
-void (*const ovr_orig_ovr_engine_flush)(CPU *c) = mock_update_matrices;
+#ifdef SNX_PIN
+// В сборке с SNX_PIN ovr_engine_camera_matrices вызывает оригинал через rt_pin_enter (runtime/rt.c):
+// на входе и выходе регистры гостя лежат в w19..w26, а после возврата rt_pin_enter переписывает c->eax..edi
+// из них. Переходник сбрасывает w19..w26 в CPU, зовёт C-заглушку и загружает обновлённые регистры обратно.
+extern void mock_update_matrices_pin(CPU *c);
+__asm__(".text\n"
+        ".global mock_update_matrices_pin\n"
+        ".type mock_update_matrices_pin, %function\n"
+        ".p2align 2\n"
+        "mock_update_matrices_pin:\n"
+        "    stp x29, x30, [sp, #-32]!\n"
+        "    mov x29, sp\n"
+        "    str x0, [sp, #16]\n"
+        "    stp w19, w20, [x0]\n"
+        "    stp w21, w22, [x0, #8]\n"
+        "    stp w23, w24, [x0, #16]\n"
+        "    stp w25, w26, [x0, #24]\n"
+        "    bl mock_update_matrices_body\n"
+        "    ldr x0, [sp, #16]\n"
+        "    ldp w19, w20, [x0]\n"
+        "    ldp w21, w22, [x0, #8]\n"
+        "    ldp w23, w24, [x0, #16]\n"
+        "    ldp w25, w26, [x0, #24]\n"
+        "    ldp x29, x30, [sp], #32\n"
+        "    ret\n"
+        ".size mock_update_matrices_pin, .-mock_update_matrices_pin\n");
+#define MOCK_ORIG mock_update_matrices_pin
+#else
+#define MOCK_ORIG mock_update_matrices_body
+#endif
+
+void (*const ovr_orig_ovr_engine_camera_matrices)(CPU *c) = MOCK_ORIG;
+void (*const ovr_orig_ovr_engine_save_game)(CPU *c) = MOCK_ORIG;
+void (*const ovr_orig_ovr_engine_flush)(CPU *c) = MOCK_ORIG;
 
 static void call_cam(u32 node)
 {

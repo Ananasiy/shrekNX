@@ -255,6 +255,12 @@ static void put(sbuf *b, const char *fmt, ...)
 {
     va_list ap;
     for (;;) {
+        if (!b->p) {
+            b->cap = 8192;
+            b->p = malloc(b->cap);
+            if (!b->p)
+                return;
+        }
         va_start(ap, fmt);
         int w = vsnprintf(b->p + b->n, b->cap - b->n, fmt, ap);
         va_end(ap);
@@ -262,8 +268,11 @@ static void put(sbuf *b, const char *fmt, ...)
             b->n += (size_t)w;
             return;
         }
-        b->cap = b->cap ? b->cap * 2 : 8192;
-        b->p = realloc(b->p, b->cap);
+        b->cap *= 2;
+        char *np = realloc(b->p, b->cap);
+        if (!np)
+            return;
+        b->p = np;
     }
 }
 
