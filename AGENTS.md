@@ -42,13 +42,17 @@ NRO). Нативный x86-32 код игры переводится в C (`reco
 * **Всегда (без игры, как в CI):**
   ```sh
   tools/build.sh mac && ctest --test-dir build/mac --output-on-failure
+  tools/.venv/bin/python -I tests/test_recomp.py
   python3 -I tests/test_public.py && python3 -I tools/check_public.py
   ```
+  Под санитайзерами (ASan+UBSan): `cmake -S . -B build/mac-san -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo "-DSNX_SANITIZE=address;undefined"` и прогон `ctest --test-dir build/mac-san --output-on-failure`.
 * **Если есть `game/`** — перегенерируй затронутые модули и запусти сценарий:
   ```sh
+  tools/.venv/bin/python -I recomp/main.py check --game game/System
   tools/.venv/bin/python -I recomp/main.py gen --game game/System --out build/gen [модули]
   tools/build.sh mac snx_boot
   build/mac/host/boot/snx_boot --user build/userdata --seconds 90 -- 1_Shreks_Swamp.unr
+  tools/.venv/bin/python -I tools/test_maps.py --boot build/mac/host/boot/snx_boot --game game --user build/test-maps --seconds 20
   ```
   Ввод без рук — `SNX_KEYS` (ниже). Нет `game/` — скажи, что игровое поведение не проверено.
 * **Рекомпилятор** — дифф-тесты всех модулей (`tests/difftest/run_all.sh`). Критерий: те же числа прошедших и тот
@@ -65,14 +69,14 @@ NRO). Нативный x86-32 код игры переводится в C (`reco
 
 | Путь | Что там |
 |---|---|
-| `recomp/` | `main.py` (CLI `discover`/`gen`), `image.py`, `x86.py`, `x87.py`, `discover.py`, `flags.py`, `regs.py`, `emit.py`, `gen.py`, `overrides.py`, `addrmap.json` |
-| `runtime/` | `abi.h` (CPU, память, `RT_ICALL`), `gen_rt.h` (макросы сгенерированного кода), `rt.c`, `loader.c`, `vmem.c`, `heap.c`, `process.c`, `overrides_{crt,core,engine,launch}.c`, `ini_cache.h`, `crt_math.h` |
-| `runtime/hle/` | kernel32 (`kernel32.c`, `kernel32_file.c`, `vfs.c`), user32, gdi32, advapi32 (+winmm, ole32, shell32), `misc.c`, `wsock32.c`, `com.c`, ddraw, `d3d8*.c`, `gl_cs.c`, `overlay.c`, dinput8, `openal.c`, `vorbisfile.c`, `bink*.c` |
-| `runtime/game/` | знание о структурах UE2: меню с геймпада (`menu.c`), обход UObject (`uobj.c`) |
-| `host/boot/` | `main.c` (запуск, ловушки, модальные окна), `input.c` (SDL → WM/DirectInput, `Snx.ini`, `SNX_KEYS`), `config.c` (`game.ini`, `User.ini`), `prof.c` |
-| `host/hello/`, `platform/` | проверка GL/DXT1; окно SDL и контекст GL |
-| `tests/` | `rt/` (CTest), `bink/` (сверка с ffmpeg), `difftest/` (unicorn, нужна игра), `test_public.py` |
-| `tools/` | `build.sh`, `check_public.py`, `switch_upload.py`, `pgo_fetch.py`, `make_rus.sh`, `make_icon.sh`, `cc_partition.sh`, `probe/` (профили, дизассемблер), `recon/` (PE, MSI, пакеты `.u`) |
+| `recomp/` | `main.py` (CLI `check`/`discover`/`gen`, `--jobs`), `image.py`, `x86.py`, `x87.py`, `discover.py`, `flags.py`, `regs.py`, `emit.py`, `gen.py`, `overrides.py`, `addrmap.json` |
+| `runtime/` | `abi.h` (CPU, память, `RT_ICALL`), `gen_rt.h` (макросы сгенерированного кода), `rt.c` (паузируемые часы), `loader.c`, `vmem.c`, `heap.c` (slab 64 КБ), `process.c`, `overrides_{crt,core,engine,launch}.c`, `ini_cache.h`, `crt_math.h` |
+| `runtime/hle/` | kernel32 (`kernel32.c`, `kernel32_file.c`, `vfs.c`), user32, gdi32, advapi32 (+winmm, ole32, shell32), `misc.c`, `wsock32.c`, `com.c`, ddraw, `d3d8*.c`, `gl_cs.c`, `overlay.c` (ASCII+кириллица), dinput8, `openal.c`, `vorbisfile.c`, `bink*.c` (потоковый+NEON) |
+| `runtime/game/` | знание о структурах UE2: меню с геймпада, легенда, `swkbd` (`menu.c`), обход UObject (`uobj.c`), вибрация по урону (`rumble.c`) |
+| `host/boot/` | `main.c` (запуск, жизненный цикл ОС, ловушки, модальные окна), `input.c` (SDL → WM/DirectInput, Quick Menu, вибрация, `Snx.ini`, `SNX_KEYS`), `config.c` (`game.ini`, `User.ini`), `prof.c` |
+| `host/hello/`, `platform/` | проверка GL/DXT1; окно SDL, контекст GL и `appletHook` Switch (`window.c`), память Switch (`switch/mem.c`) |
+| `tests/` | `rt/` (12 тестов CTest), `bink/` (сверка с ffmpeg), `difftest/` (unicorn, нужна игра), `test_recomp.py` (20 тестов), `test_public.py` |
+| `tools/` | `build.sh`, `check_public.py`, `test_maps.py`, `switch_upload.py`, `pgo_fetch.py`, `make_rus.sh`, `make_icon.sh`, `cc_partition.sh`, `probe/` (профили, дизассемблер, `crash.py`), `recon/` (PE, MSI, пакеты `.u`) |
 
 ---
 
@@ -138,7 +142,8 @@ EXCEPTION_RECORD/CONTEXT на стеке гостя и зовёт цепочку
 локализациях). Вызовы экспортов из других модулей прямые: новый оверрайд — перегенерируй все модули. Сейчас заменены: CRT (`mem*/str*`, математика с семантикой MSVC в `crt_math.h`, `rand/srand`,
 статические `memcpy` всех модулей), Hor+ в `FCameraSceneNode::UpdateMatrices`, пропуск `Flush(1)` после
 `SaveGame`, кеш `TFieldIterator<UProperty>` (эпоха — `UStruct::Link`, `CollectGarbage`), быстрый
-`FArchiveFileWriter::Serialize`, `Sleep(500)` в `TryRenderDevice` (по адресу возврата `0x11106a85`),
+`FArchiveFileWriter::Serialize`, быстрый `FArchiveFileReader::Serialize` (`game.exe!0x10908610`, `ovr_launch_file_read`,
+копия из 1 КБ буфера с проверкой `SNX_AR_CHECK=1`), `Sleep(500)` в `TryRenderDevice` (по адресу возврата `0x11106a85`),
 `FConfigCacheIni::GetString` (game.exe, по памяти кеша ini), `FFileManagerWindows::FileSize` (game.exe, без открытия
 файла, если размер известен), пропуск перечитывания конфига в `UObject::SaveConfig` и обход классов в нём (ниже).
 
@@ -196,20 +201,30 @@ EXCEPTION_RECORD/CONTEXT на стеке гостя и зовёт цепочку
   GDI-шрифты через FreeType. Фатальная ошибка движка идёт в `user32_modal_hook` (`host/boot/main.c: on_modal`).
 * **D3D8 → GL** (`d3d8*.c`). Шейдеры держи в рамках GL 4.1 core (мак), хотя Switch даёт 4.3. Соглашение
   `d3d8_int.h`: изображения «сверху вниз», FBO с перевёрнутой осью y, поэтому `D3DCULL_CW` → `GL_FRONT`, +0,5
-  пикселя, глубина `2z − w`. Фиксированный конвейер генерируется в GLSL по ключу `ffkey` (кеш 4096, ключи — в
-  `<user>/System/SnxPrograms.bin`, собираются фоном при создании устройства); ps.1.x — `d3d8_ps.c`. Не
-  реализованы: state blocks, CopyRects, UpdateTexture, GetFrontBuffer, volume-текстуры, ProcessVertices, палитры,
-  программируемые vs.1.1 — дают ловушку COM с именем слота или `hle_todo`.
+  пикселя, глубина `2z − w`. Гранулярные флаги состояния (`gl_dirty`, `gen_*`), нормальная матрица `u_nrm_mat`
+  считается на CPU. Фиксированный конвейер генерируется в GLSL по ключу `ffkey` (динамический кеш до 65536 с
+  LRU-вытеснением, ключи и байткод `ps.1.x` — в `<user>/System/SnxPrograms.bin` v2, опциональный кеш бинарников
+  GL — `SnxProgramBins.bin`, собираются фоном при создании устройства); `ps.1.x` — `d3d8_ps.c`. Пост-проход
+  `Present` применяет LUT-гамму 256×1 (`SetGammaRamp`) и 4:3-pillarbox для страниц меню (`MenuAspect4x3`).
+  Реализованы `CopyRects`, `UpdateTexture`, `GetFrontBuffer` и `StateBlocks`. Не реализованы (не используются
+  игрой `D3DDrv.dll`): volume-текстуры, `ProcessVertices`, палитры, программируемые `vs.1.1` — дают ловушку COM
+  с именем слота или `hle_todo`.
 * **Поток рендера** (`gl_cs.c`): все вызовы GL слоя D3D8 — макросы `cs_gl*` в кольцо 64 МБ. Новый вызов GL
-  добавляй так же; ожидание (`cs_sync`) — только когда нужен результат. Present — `cs_swap`, отставание ≤ 1 кадра.
-* **Звук и видео**: `bink.c` (контейнер), `bink_audio.c` (свой декодер; сверяй с ffmpeg `tests/bink/compare.py`),
-  `bink_video.c` (libavcodec), `openal.c` (без EAX), `vorbisfile.c` (FILE* гостя читается его msvcr70).
+  добавляй так же; ожидание (`cs_sync`) — только когда нужен результат. Present — `cs_swap`, отставание ≤ 1 кадра;
+  при штатном выходе `cs_stop()` дренирует хвост и останавливает поток.
+* **Звук и видео**: `bink.c` (потоковое чтение файловых `.bik`), `bink_audio.c` (свой декодер; сверяй с ffmpeg
+  `tests/bink/compare.py`), `bink_video.c` (libavcodec + NEON YUV→RGB на ARM64), `openal.c` (без EAX, пауза
+  `openal_pause` и `openal_shutdown`), `vorbisfile.c` (FILE* гостя читается его msvcr70).
 * **Ввод**: в игре геймпад — джойстик DirectInput (`dinput8.c`, привязки `Joy*` пишет `config.c` в `User.ini`),
-  в меню — мышь и фокус (`runtime/game/menu.c`). Скрипты UI разбирай `tools/recon/upkg.py` (`exports`/`at`/`dis`/
+  в меню — мышь и фокус (`runtime/game/menu.c`, легенда, значки, `swkbdShow`), поверх — Quick Menu (`ZL+Plus`)
+  и вибрация (Switch — hid libnx `hidSendVibrationValues`, SDL там вибрацию не передаёт; ПК — `SDL_GameControllerRumble`; события — урон и гибель по `Pawn.Health`, попадания героя по флагам `bWasHitInThisAttack` целей, `runtime/game/rumble.c`). Скрипты UI разбирай `tools/recon/upkg.py` (`exports`/`at`/`dis`/
   `grep`). Настройки порта — `<user>/System/Snx.ini`, описаны в `docs/CONSOLE.md`.
-* **Switch**: выход и ловушка завершают процесс через `svcExitProcess` (после `exit()` потоки жили в выгруженном
-  коде); падения ловит `__libnx_exception_handler`; окно SDL после создания не меняется; вывод без nxlink —
-  `<user>/snx.log`.
+* **Switch**: `appletHook` (`OnFocusState`, `OnResume`, `OnOperationMode`, `OnExitRequest`), в applet-режиме —
+  текстовая подсказка консолью libnx до SDL (`rt_platform_preflight`, `platform/switch/mem.c`; системное окно
+  ошибки из апплета роняло Atmosphère); выход и ловушка завершают процесс через `svcExitProcess` после
+  `cs_stop`/`openal_shutdown`/`hle_file_flush_all` (фоновые потоки `kernel32_file.c` и `CreateThread` ещё без
+  кооперативной остановки); падения ловит `__libnx_exception_handler` (разбор — `tools/probe/crash.py`); окно SDL
+  после создания не меняется; вывод без nxlink — `<user>/snx.log`.
 
 ---
 
@@ -217,17 +232,18 @@ EXCEPTION_RECORD/CONTEXT на стеке гостя и зовёт цепочку
 
 ```sh
 tools/build.sh mac|mac-rus|switch|switch-rus|switch-pgo [цели]   # каталог build/<вариант>
-tools/.venv/bin/python -I recomp/main.py discover --game game/System [модули]
-tools/.venv/bin/python -I recomp/main.py gen --game game/System --out build/gen [модули]
+tools/.venv/bin/python -I recomp/main.py check --game game/System
+tools/.venv/bin/python -I recomp/main.py discover --game game/System [-j N] [модули]
+tools/.venv/bin/python -I recomp/main.py gen --game game/System --out build/gen [-j N] [модули]
 build/mac/host/boot/snx_boot [--game game] [--user DIR] [--dlls-only] [--headless] [--seconds N] [-- карта]
+tools/.venv/bin/python -I tools/test_maps.py --boot build/mac/host/boot/snx_boot --game game --user build/test-maps
 tools/make_rus.sh Shrek2RUS game/System/game.exe   # затем gen --game build/game-rus/System --out build/gen-rus
 cmake -S . -B build/mac-rel -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSNX_TRACE=OFF   # сборка для замеров
 ```
 
 * `--seconds N` сбрасывает лог движка и выходит с кодом 0 — используй для коротких прогонов. Headless — копия
-  пользовательского каталога с `RenderDevice=Engine.NullRenderDevice` и `--headless`.
-* Генерация: `SNX_INLINE_MAX`, `SNX_REGS=0`, `SNX_REGCHECK=1`. CMake: `SNX_TRACE` (в `build/mac` включён,
-  ≈−35 % скорости), `SNX_PIN` (Switch), `SNX_PGO=gen|use`, `SNX_PGO_DIR`, `SNX_SECTION_ORDER`, `SNX_VARIANT=rus`.
+  пользовательского каталога с `RenderDevice=Engine.NullRenderDevice` и `--headless` (или `tools/test_maps.py --headless`).
+* Генерация: `SNX_INLINE_MAX`, `SNX_REGS=0`, `SNX_REGCHECK=1`, `SNX_FPU_SINGLE=1` (округление арифметики x87 и `fsqrt` к `float`). CMake: `SNX_TRACE` (в `build/mac` включён, ≈−35 % скорости), `SNX_SANITIZE` (`address;undefined`), `SNX_PIN` (Switch и Linux ARM64 GCC), `SNX_PGO=gen|use`, `SNX_PGO_DIR`, `SNX_SECTION_ORDER`, `SNX_VARIANT=rus`.
 * Ограничение времени на маке: `perl -e "alarm 120; exec @ARGV" ...` (`timeout` нет).
 
 ### Дифф-тесты
@@ -254,9 +270,10 @@ tools/build.sh mac difftest_msvcr70 && UC_IGNORE_REG_BREAK=1 tools/.venv/bin/pyt
 | `SNX_HLE_TRACE=1` | каждый вызов HLE (~100 МБ; фоновый поток Core `10174140` шумит критическими секциями) |
 | `SNX_CHECK_ABI=1` | после косвенного вызова проверить esi/edi/ebx/ebp |
 | `SNX_KEYS=<с>:<VK hex>,<с>:@<u>/<v>,<с>:%<кнопка>+,<с>:~LX=<v>` | ввод без рук: клавиши, щелчок, кнопки и стики геймпада |
-| `SNX_SHOT=300,600`, `SNX_SHOT_DIR`, `SNX_DUMP_DRAWS=<кадр>` | PNG заднего буфера; состояние каждой отрисовки (`tools/probe/sheet.py`) |
+| `SNX_SHOT=300,600`, `SNX_SHOT_DIR`, `SNX_DUMP_DRAWS=<кадр>` | PNG итогового кадра после Present (4:3, гамма, оверлей); состояние каждой отрисовки (`tools/probe/sheet.py`) |
 | `SNX_EH_TEST=<с>`, `SNX_ERR_TEST=<с>` | исключение C++ в `StaticLoadObject`; фатальная ошибка движка |
 | `SNX_CFG_TEST=<с>[,<n>[,<мс>]]`, `SNX_CFG_CHECK=1` | n подборов монеты бонусного уровня (`bonuscoins`+1 и `SaveConfig` контроллера героя) с паузой (250 мс; 0 — подряд в одном кадре, тогда каждый ждёт запись `User.ini` предыдущего), время — `[core] SaveConfig`; сверка пропусков перечитывания и `GetString` с оригиналом |
+| `SNX_AR_CHECK=1` | сверка быстрого пути `ovr_launch_file_read` (`FArchiveFileReader::Serialize`) с оригиналом |
 | `SNX_FIELD_CHECK=1` | сверить кеш обхода свойств с полным обходом |
 | `SNX_PERF=1`, `SNX_NOVSYNC=1`, `SNX_PROF=<файл>`, `SNX_CALLSTATS=<файл>` | инструкции и такты на кадр; без vsync; профиль; счётчики входов |
 | `SNX_RENDER_THREAD=0`, `SNX_GLTHREAD=1`, `SNX_FILE_CACHE_MB` | без потока рендера; glthread Mesa; бюджет образов пакетов |
@@ -300,12 +317,24 @@ PGO: `tools/build.sh switch-pgo` → прогон с `--pgo-dump` → `python3 -
 
 ---
 
-## Состояние (0.1.0)
+## Состояние (0.1.0 + ветка `perf/recomp`)
 
-Игра играется на Switch: меню, первый уровень, катсцены, магазин, звук, ролики, геймпад, сохранения; обе
-локализации. Все импорты реализованы; дифф-тесты без необъяснённых расхождений.
+Игра играется на Switch (0.1.0): меню, первый уровень, катсцены, магазин, звук, ролики, геймпад, сохранения; обе
+локализации. Все импорты реализованы; дифф-тесты без необъяснённых расхождений. На ветке `perf/recomp`
+объединены доработки инфраструктуры/CI/тестов, slab-аллокатор и потоковый Bink+NEON, консольный UI (кириллица,
+легенда, Quick Menu, вибрация, `swkbd`), системные хуки Switch/POSIX и паузируемые часы, гранулярный D3D8 +
+гамма-LUT + 4:3-меню + `CopyRects`/`UpdateTexture`/`GetFrontBuffer`/`StateBlocks` + кеш `ps.1.x`/бинарников GL,
+а также `recomp check`, параллельный `gen` и нативный `FArchiveFileReader::Serialize`.
 
-Точка отсчёта для замеров (Switch, болото у точки сохранения после катсцены, 1280×720, CPU 1020 МГц):
+**Проверено на macOS arm64:** CTest 11/11 (включая ASan+UBSan), `tests/test_recomp.py` 20/20, `recomp check`
+(12/12, 56/56, 5/5), перегенерация 12 модулей, живые прогоны `Book_FrontEnd.unr` (4:3 pillarbox, легенда кнопок,
+Quick Menu), `1_Shreks_Swamp.unr` (в т. ч. `SNX_AR_CHECK=1`: 0 расхождений) и `3_The_Hunt_Part4.unr` (проходит
+оба исключения C++, 0 `TRAP`/`TODO`/`GL error`; `[abi]` на `Core.dll!0x10167ba1` из `_CallSettingFrame`
+`msvcr70.dll!0x13007a2f` — штатный не-ABI вызов `catch`-функлета, где `_CallSettingFrame` сам сохраняет `esi/edi`).
+**Switch и Linux:** сборка/запуск на реальном железе Switch (хуки HOME/сон/док/applet, `swkbd`, бинарный кеш GL,
+новые замеры FPS) и на реальном Linux (`linux-arm64` CI) — `[проверить]`.
+
+Точка отсчёта для замеров (0.1.0, Switch, болото у точки сохранения после катсцены, 1280×720, CPU 1020 МГц):
 **38,0–38,8 кадр/с с PGO, 34,2–35,3 без PGO**. Меню — 60, ролики — 45–52. Кадр сохранения — 0,77–0,79 с,
 фризы 50–200 мс от сборки программ GL — только в первом запуске. На Switch упор в поток гостя (в основном
 сгенерированный код), поток рендера простаивает.
@@ -318,10 +347,12 @@ FDIV, `fnstenv/fldenv` (не реализованы), `_j0/_j1/_jn` на кра�
 
 **Открытые задачи:**
 * Фризы: сборка программ GL на отдельном контексте (риск: контексты Mesa nouveau делят pushbuf), остаток
-  сохранения (`SavePackage`).
-* Производительность: тени-проекторы (`UShadowBitmapMaterial::Get` — 8 % потока гостя), D3D8 в потоке рендера,
-  нативное чтение `FArchive`, старт игры. Выбирай по свежему профилю.
-* D3D8: недостающие методы (выше); проверить тени в катсцене полёта Осла после исправления полупикселя.
-* 2D-интерфейс растянут в 16:9.
-* Не проверены: загрузка сейвов, переходы между уровнями (`3_The_Hunt_Part4`), окно фатальной ошибки на Switch,
-  HOME и сон (`docs/CONSOLE.md`), визуальная сверка с ПК.
+  сохранения (`SavePackage`), проверка кеша бинарников `SnxProgramBins.bin` на Mesa Switch (`[проверить]`).
+* Производительность: тени-проекторы (`UShadowBitmapMaterial::Get` `Engine.dll!0x120027ed` — 8 % потока гостя),
+  диспетчер `GNatives` (`Core.dll!0x1021b780`), D3D8 в потоке рендера, старт игры. Выбирай по свежему профилю
+  на Switch.
+* 2D HUD во время игры по-прежнему растянут в 16:9 (для страниц меню есть опциональный 4:3-pillarbox с 4:3-проекцией камеры, по умолчанию выключен).
+* Кооперативная остановка фоновых потоков `kernel32_file.c` и `CreateThread` (чтобы отказаться от `svcExitProcess`),
+  смена разрешения буфера (`setres`) при `OnOperationMode` (док ↔ портатив).
+* Не проверены на железе Switch: загрузка сейвов, переходы между уровнями, окно фатальной ошибки,
+  HOME/сон/док/applet-диалог/экранная клавиатура (`docs/CONSOLE.md`), визуальная сверка с ПК и Linux-сборка.

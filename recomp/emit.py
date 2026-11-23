@@ -6,6 +6,8 @@
 * флаги — сливаются с jcc/setcc/cmovcc (fa/fb/fr сеттера) или материализуются в cf/zf/... по живости;
 * x87 — статическая глубина стека, ST(i) — локальные double f0..f7.
 """
+import os
+
 from discover import TERMINATORS
 from flags import (ALL, A, C, CC_READS, FUSABLE, NAMES, O, P, S, Z, flag_info, jcc_cc, liveness, plan)
 import regs
@@ -20,6 +22,11 @@ SIGNBIT = {1: 0x80, 2: 0x8000, 4: 0x80000000}
 SMALL_DISP = 0x10000
 
 
+def fpu_single_mode():
+    """Режим 24-битной мантиссы x87 (SNX_FPU_SINGLE=1, как на ПК после создания D3D8 без FPU_PRESERVE)."""
+    return os.environ.get("SNX_FPU_SINGLE") == "1"
+
+
 class EmitError(Exception):
     pass
 
@@ -29,10 +36,11 @@ def hx(v):
 
 
 class FuncCompiler:
-    def __init__(self, mod, func, ctx):
+    def __init__(self, mod, func, ctx, fpu_single=None):
         self.mod = mod
         self.f = func
         self.ctx = ctx  # общий контекст: резолв вызовов, сводки x87, оверрайды
+        self.fpu_single = fpu_single_mode() if fpu_single is None else bool(fpu_single)
         self.entry = func.entry
         self.addrs = func.insns
         self.ins = {a: mod.insns[a] for a in self.addrs}
@@ -1622,7 +1630,8 @@ class FuncCompiler:
         if k == "unary":
             f = a[0]
             v = self.st(0)
-            e = {"chs": f"-{v}", "abs": f"fabs({v})", "sqrt": f"sqrt({v})", "sin": f"X87_TRIG({v}, sin({v}))", "cos": f"X87_TRIG({v}, cos({v}))",
+            sq = f"(double)(float)sqrt({v})" if self.fpu_single else f"sqrt({v})"
+            e = {"chs": f"-{v}", "abs": f"fabs({v})", "sqrt": sq, "sin": f"X87_TRIG({v}, sin({v}))", "cos": f"X87_TRIG({v}, cos({v}))",
                  "rndint": f"rt_frndint(c, {v})", "f2xm1": f"(exp2({v}) - 1.0)"}[f]
             return [f"{v} = {e};"]
         if k == "binpop":
@@ -1658,6 +1667,8 @@ class FuncCompiler:
     def farith(self, opn, dst, x, y):
         e = {"add": f"{x} + {y}", "mul": f"{x} * {y}", "sub": f"{x} - {y}", "subr": f"{y} - {x}",
              "div": f"{x} / {y}", "divr": f"{y} / {x}"}[opn]
+        if self.fpu_single:
+            return f"{dst} = (double)(float)({e});"
         return f"{dst} = {e};"
 
     def emit_intrinsic(self, ins, name):
@@ -1670,6 +1681,8 @@ class FuncCompiler:
                "_CIatan2": f"{s1} = crt_atan2({s1}, {s0});"}
         if name in two:
             return [two[name]]
+        if name == "_CIsqrt" and self.fpu_single:
+            return [f"{s0} = (double)(float)sqrt({s0});"]
         fn = {"_CIsin": "sin", "_CIcos": "cos", "_CItan": "tan", "_CIasin": "asin", "_CIacos": "acos",
               "_CIatan": "atan", "_CIsinh": "sinh", "_CIcosh": "cosh", "_CItanh": "tanh", "_CIexp": "crt_exp",
               "_CIlog": "log", "_CIlog10": "log10", "_CIsqrt": "sqrt"}[name]

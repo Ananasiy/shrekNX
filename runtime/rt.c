@@ -2,13 +2,20 @@
 #include "runtime/rt.h"
 #include "runtime/process.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <time.h>
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
 #include <sys/mman.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
 #endif
 
 u8 *g_mem;
@@ -48,14 +55,16 @@ static void cnt_init(void);
 int rt_mem_init(void)
 {
     cnt_init();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
     // 4 ГБ виртуального адреса: любой u32-адрес попадает в резерв, мусорный указатель даёт SIGSEGV,
     // а не порчу хостовой памяти. Рабочее окно [64 КБ, RT_WINDOW) — чтение/запись, страница 0 закрыта.
-    void *p = mmap(NULL, 0x100000000ull, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    void *p = mmap(NULL, 0x100000000ull, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED)
         return -1;
-    if (mprotect((u8 *)p + 0x10000, RT_WINDOW - 0x10000, PROT_READ | PROT_WRITE) != 0)
+    if (mprotect((u8 *)p + 0x10000, RT_WINDOW - 0x10000, PROT_READ | PROT_WRITE) != 0) {
+        munmap(p, 0x100000000ull);
         return -1;
+    }
     g_mem = p;
     return 0;
 #else
@@ -482,6 +491,8 @@ void rt_cpuid(u32 leaf, u32 r[4])
 
 // часто зовётся гостем (rdtsc — замеры статистики UE2): без системных вызовов
 u64 rt_file_ns;
+u32 rt_gc_epoch = 1;
+int rt_menu_aspect_4x3;
 
 u64 rt_ticks_ns(void)
 {
@@ -496,6 +507,73 @@ u64 rt_ticks_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
 #endif
+}
+
+// Паузируемые монотонные часы гостя: защищают UE2 от гигантских дельт времени после HOME/сна.
+// Инвариант под g_clock_lock: g_clock_guest + g_clock_off == g_clock_raw, g_clock_guest не убывает.
+#define RT_GUEST_MAX_STEP_NS 500000000ull  // 500 мс: защита от скачка при сне ОС без предварительной паузы
+static pthread_mutex_t g_clock_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_clock_init;
+static int g_clock_paused;
+static u64 g_clock_raw;    // последнее учтённое rt_ticks_ns()
+static u64 g_clock_guest;  // текущее гостевое время, нс
+static u64 g_clock_off;    // накопленное вычтенное время пауз и срезанных скачков
+
+static void clock_init_locked(u64 raw)
+{
+    if (g_clock_init)
+        return;
+    g_clock_init = 1;
+    g_clock_raw = raw;
+    g_clock_guest = raw;
+    g_clock_off = 0;
+}
+
+static void clock_advance_locked(u64 raw)
+{
+    clock_init_locked(raw);
+    if (raw <= g_clock_raw)
+        return;
+    u64 dt = raw - g_clock_raw;
+    g_clock_raw = raw;
+    if (g_clock_paused) {
+        g_clock_off += dt;
+        return;
+    }
+    if (dt > RT_GUEST_MAX_STEP_NS) {
+        g_clock_off += dt - RT_GUEST_MAX_STEP_NS;
+        dt = RT_GUEST_MAX_STEP_NS;
+    }
+    g_clock_guest += dt;
+}
+
+u64 rt_guest_ticks_ns(void)
+{
+    pthread_mutex_lock(&g_clock_lock);
+    clock_advance_locked(rt_ticks_ns());
+    u64 r = g_clock_guest;
+    pthread_mutex_unlock(&g_clock_lock);
+    return r;
+}
+
+void rt_clock_pause(int on)
+{
+    pthread_mutex_lock(&g_clock_lock);
+    clock_advance_locked(rt_ticks_ns());
+    g_clock_paused = on ? 1 : 0;
+    pthread_mutex_unlock(&g_clock_lock);
+}
+
+void rt_clock_sync(void)
+{
+    pthread_mutex_lock(&g_clock_lock);
+    u64 raw = rt_ticks_ns();
+    clock_init_locked(raw);
+    if (raw > g_clock_raw) {
+        g_clock_off += raw - g_clock_raw;
+        g_clock_raw = raw;
+    }
+    pthread_mutex_unlock(&g_clock_lock);
 }
 
 u64 (*rt_rdtsc_hook)(void);

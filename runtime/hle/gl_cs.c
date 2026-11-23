@@ -34,14 +34,17 @@ struct cs_rec {
 
 static uint8_t *g_ring;
 static _Atomic uint64_t g_head, g_tail;  // опубликовано писателем / исполнено читателем
-static uint64_t g_wr;                    // позиция писателя (только поток гостя)
+static _Atomic uint64_t g_wr;            // позиция писателя (пишет поток гостя; читается cs_stop при выходе)
 static uint64_t g_woken;                 // g_wr при последнем пробуждении потока рендера (только поток гостя)
 static uint64_t g_published;             // g_wr при последней публикации g_head (только поток гостя)
 static uint64_t g_swap_end[4], g_frames;  // конец записи показа кадра (по номеру кадра)
-static int g_on;
+static _Atomic int g_on;
+static _Atomic int g_stop;               // запрос завершения потока рендера после дренажа очереди
+static _Atomic int g_exited;             // поток рендера завершил цикл
 static _Thread_local int t_render;
 static pthread_t g_thread;
 
+static pthread_mutex_t g_life_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv_work = PTHREAD_COND_INITIALIZER, g_cv_progress = PTHREAD_COND_INITIALIZER;
 static _Atomic int g_render_sleeping;
@@ -53,10 +56,12 @@ static u64 g_wait_total_ns;  // то же ожидание с начала ра�
 static _Atomic uint64_t g_busy_ns, g_swap_ns;
 void (*cs_render_thread_hook)(void);
 
-int cs_enabled(void) { return g_on; }
+static void pool_reset(void);
+
+int cs_enabled(void) { return atomic_load_explicit(&g_on, memory_order_acquire); }
 int cs_on_render_thread(void) { return t_render; }
 
-static inline int direct(void) { return !g_on || t_render; }
+static inline int direct(void) { return !atomic_load_explicit(&g_on, memory_order_acquire) || t_render; }
 
 static inline void cpu_relax(void)
 {
@@ -68,14 +73,15 @@ static inline void cpu_relax(void)
 // ---------------------------------------------------------------- ожидание
 static void publish(void)
 {
-    g_published = g_wr;
-    atomic_store(&g_head, g_wr);
+    uint64_t wr = atomic_load_explicit(&g_wr, memory_order_relaxed);
+    g_published = wr;
+    atomic_store(&g_head, wr);
 }
 
 static void wake_render(void)
 {
     publish();
-    g_woken = g_wr;
+    g_woken = atomic_load_explicit(&g_wr, memory_order_relaxed);
     if (atomic_load(&g_render_sleeping)) {
         pthread_mutex_lock(&g_mx);
         pthread_cond_signal(&g_cv_work);
@@ -95,12 +101,12 @@ static void wake_guest(uint64_t tail)
 // поток гостя: ждать, пока поток рендера не исполнит всё до позиции target (будят, только когда дошёл)
 static void wait_tail(uint64_t target)
 {
-    if (atomic_load(&g_tail) >= target)
+    if (atomic_load(&g_tail) >= target || atomic_load(&g_exited))
         return;
     wake_render();
     u64 t0 = rt_ticks_ns();
     for (int i = 0; i < 4000; i++) {
-        if (atomic_load(&g_tail) >= target) {
+        if (atomic_load(&g_tail) >= target || atomic_load(&g_exited)) {
             g_st.wait_ns += rt_ticks_ns() - t0;
             g_wait_total_ns += rt_ticks_ns() - t0;
             return;
@@ -109,7 +115,7 @@ static void wait_tail(uint64_t target)
     }
     pthread_mutex_lock(&g_mx);
     atomic_store(&g_wait_target, target);
-    while (atomic_load(&g_tail) < target)
+    while (atomic_load(&g_tail) < target && !atomic_load(&g_exited))
         pthread_cond_wait(&g_cv_progress, &g_mx);
     atomic_store(&g_wait_target, UINT64_MAX);
     pthread_mutex_unlock(&g_mx);
@@ -123,7 +129,7 @@ unsigned long long cs_wait_total_ns(void) { return g_wait_total_ns; }
 static void *cs_begin(size_t size, cs_exec exec)
 {
     size = (size + 15) & ~(size_t)15;
-    uint64_t pos = g_wr, off = pos % RING_SIZE;
+    uint64_t pos = atomic_load_explicit(&g_wr, memory_order_relaxed), off = pos % RING_SIZE;
     if (off + size > RING_SIZE) {
         wait_tail(pos + (RING_SIZE - off) + size - RING_SIZE);
         cs_rec *skip = (cs_rec *)(g_ring + off);
@@ -136,7 +142,7 @@ static void *cs_begin(size_t size, cs_exec exec)
     cs_rec *r = (cs_rec *)(g_ring + off);
     r->exec = exec;
     r->size = (uint32_t)size;
-    g_wr = pos + size;
+    atomic_store_explicit(&g_wr, pos + size, memory_order_relaxed);
     g_st.recs++;
     g_st.bytes += size;
     return r;
@@ -144,9 +150,10 @@ static void *cs_begin(size_t size, cs_exec exec)
 
 static void cs_end(void)
 {
-    if (g_wr - g_published < PUBLISH_BYTES)
+    uint64_t wr = atomic_load_explicit(&g_wr, memory_order_relaxed);
+    if (wr - g_published < PUBLISH_BYTES)
         return;
-    if (g_wr - g_woken >= WAKE_BYTES)
+    if (wr - g_woken >= WAKE_BYTES)
         wake_render();
     else
         publish();
@@ -185,17 +192,22 @@ static void *render_main(void *arg)
     for (;;) {
         uint64_t head = atomic_load(&g_head);
         if (head == tail) {
-            for (int i = 0; i < 2000 && head == tail; i++) {
+            for (int i = 0; i < 2000 && head == tail && !atomic_load(&g_stop); i++) {
                 cpu_relax();
                 head = atomic_load(&g_head);
             }
+            head = atomic_load(&g_head);
             if (head == tail) {
                 pthread_mutex_lock(&g_mx);
                 atomic_store(&g_render_sleeping, 1);
-                while ((head = atomic_load(&g_head)) == tail)
+                while ((head = atomic_load(&g_head)) == tail && !atomic_load(&g_stop))
                     pthread_cond_wait(&g_cv_work, &g_mx);
                 atomic_store(&g_render_sleeping, 0);
                 pthread_mutex_unlock(&g_mx);
+                // Перечитать g_head после наблюдения g_stop == 1: cs_stop сначала публикует g_head, затем g_stop.
+                head = atomic_load(&g_head);
+                if (head == tail && atomic_load(&g_stop))
+                    break;
             }
         }
         u64 t0 = rt_ticks_ns();
@@ -210,27 +222,77 @@ static void *render_main(void *arg)
         }
         atomic_fetch_add(&g_busy_ns, rt_ticks_ns() - t0);
     }
+    plat_gl_unbind();
+    pthread_mutex_lock(&g_mx);
+    atomic_store(&g_exited, 1);
+    pthread_cond_broadcast(&g_cv_progress);
+    pthread_mutex_unlock(&g_mx);
     return NULL;
 }
 
 int cs_start(int core)
 {
-    if (g_on)
+    pthread_mutex_lock(&g_life_lock);
+    if (atomic_load_explicit(&g_on, memory_order_relaxed)) {
+        pthread_mutex_unlock(&g_life_lock);
         return 0;
+    }
     g_ring = malloc(RING_SIZE);
-    if (!g_ring)
+    if (!g_ring) {
+        pthread_mutex_unlock(&g_life_lock);
         return -1;
+    }
+    atomic_store(&g_head, 0);
+    atomic_store(&g_tail, 0);
+    atomic_store(&g_wr, 0);
+    atomic_store(&g_stop, 0);
+    atomic_store(&g_exited, 0);
+    atomic_store(&g_render_sleeping, 0);
+    atomic_store(&g_wait_target, UINT64_MAX);
+    g_woken = g_published = g_frames = 0;
+    memset(g_swap_end, 0, sizeof g_swap_end);
+    pool_reset();
     g_core = core;
     pthread_attr_t a;
     pthread_attr_init(&a);
     pthread_attr_setstacksize(&a, 1u << 20);
-    if (pthread_create(&g_thread, &a, render_main, NULL) != 0) {
+    int rc = pthread_create(&g_thread, &a, render_main, NULL);
+    pthread_attr_destroy(&a);
+    if (rc != 0) {
         free(g_ring);
+        g_ring = NULL;
+        pthread_mutex_unlock(&g_life_lock);
         return -1;
     }
-    g_on = 1;
+    atomic_store_explicit(&g_on, 1, memory_order_release);
+    pthread_mutex_unlock(&g_life_lock);
     fprintf(stderr, "[cs] render thread on core %d\n", core);
     return 0;
+}
+
+void cs_stop(void)
+{
+    if (t_render)
+        return;  // сам поток рендера не может ждать себя
+    pthread_mutex_lock(&g_life_lock);
+    if (!atomic_load_explicit(&g_on, memory_order_relaxed)) {
+        pthread_mutex_unlock(&g_life_lock);
+        return;
+    }
+    // Допубликовать оставшиеся записи писателя, разбудить поток рендера и дождаться полного дренажа
+    uint64_t wr = atomic_load(&g_wr);
+    if (atomic_load(&g_head) < wr)
+        atomic_store(&g_head, wr);
+    pthread_mutex_lock(&g_mx);
+    atomic_store(&g_stop, 1);
+    pthread_cond_broadcast(&g_cv_work);
+    pthread_mutex_unlock(&g_mx);
+    pthread_join(g_thread, NULL);
+    atomic_store_explicit(&g_on, 0, memory_order_release);
+    free(g_ring);
+    g_ring = NULL;
+    pool_reset();
+    pthread_mutex_unlock(&g_life_lock);
 }
 
 // ---------------------------------------------------------------- замыкания
@@ -257,7 +319,7 @@ void cs_sync(void (*fn)(void *), void *arg)
     q->fn = fn;
     q->arg = arg;
     cs_end();
-    wait_tail(g_wr);  // хвост сдвигается после исполнения записи
+    wait_tail(atomic_load_explicit(&g_wr, memory_order_relaxed));  // хвост сдвигается после исполнения записи
 }
 
 typedef struct {
@@ -317,7 +379,7 @@ void cs_swap(void)
     cs_end();
     wake_render();
     // кадр k записан; пока поток рендера исполняет его, гость пишет k+1, но не дальше (MAX_LAG = 1)
-    g_swap_end[g_frames % 4] = g_wr;
+    g_swap_end[g_frames % 4] = atomic_load_explicit(&g_wr, memory_order_relaxed);
     if (g_frames >= MAX_LAG)
         wait_tail(g_swap_end[(g_frames - MAX_LAG) % 4]);
     g_frames++;
@@ -792,6 +854,8 @@ static struct {
     GLuint names[POOL_N];
     int n;
 } g_pool[NPOOLS];
+
+static void pool_reset(void) { memset(g_pool, 0, sizeof g_pool); }
 
 static void y_fill(void *p)
 {

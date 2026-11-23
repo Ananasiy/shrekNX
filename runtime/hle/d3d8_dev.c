@@ -117,9 +117,424 @@ static void set_defaults(d3ddev *d)
     d->vpz[1] = 1.0f;
     d->sampler_dirty = 0xFF;
     d->gen_xf++;
+    d->gen_view++;
+    d->gen_texm++;
+    d->gen_vp++;
+    d->gen_clip++;
     d->gen_light++;
     d->gen_mat++;
-    d->gen_misc++;
+    d->gen_const++;
+    d->gen_psc++;
+    d->gen_bump++;
+    d->gl_dirty = GLD_ALL;
+}
+
+// ================================================================ гранулярное изменение состояния и StateBlocks
+// Вспомогательные функции изменения состояния устройства (общие для Set* и ApplyStateBlock)
+static void apply_rs(d3ddev *d, u32 state, u32 val)
+{
+    if (state >= 256 || d->rs[state] == val)
+        return;
+    d->rs[state] = val;
+    switch (state) {
+    case 7: case 14: case 23:
+        d->gl_dirty |= GLD_DEPTH;
+        break;
+    case 8: case 47:
+        d->gl_dirty |= GLD_POLY;
+        break;
+    case 19: case 20: case 27: case 171:
+        d->gl_dirty |= GLD_BLEND;
+        break;
+    case 22:
+        d->gl_dirty |= GLD_CULL;
+        break;
+    case 24: case 34: case 36: case 37: case 38: case 60: case 139:
+        d->gen_const++;
+        break;
+    case 52: case 53: case 54: case 55: case 56: case 57: case 58: case 59:
+        d->gl_dirty |= GLD_STENCIL;
+        break;
+    case 152:
+        d->gl_dirty |= GLD_CLIP;
+        break;
+    case 168:
+        d->gl_dirty |= GLD_COLORMASK;
+        break;
+    default:
+        // Остальные RS влияют только на ключ шейдера ffkey
+        break;
+    }
+}
+
+static void apply_tss(d3ddev *d, u32 s, u32 t, u32 val)
+{
+    if (s >= MAX_STAGES || t >= 32 || d->tss[s][t] == val)
+        return;
+    d->tss[s][t] = val;
+    if (t >= 7 && t <= 10)
+        d->gen_bump++;
+    else if ((t >= 13 && t <= 21) || t == 25)
+        d->sampler_dirty |= 1u << s;
+}
+
+static void apply_tex(d3ddev *d, u32 s, d3dtex *t)
+{
+    if (s >= MAX_STAGES || t == d->tex[s])
+        return;
+    if (t)
+        com_addref(t->obj);
+    if (d->tex[s])
+        com_release(d->tex[s]->obj);
+    d->tex[s] = t;
+    // SetTexture не трогает матрицы, viewport, GL render states и константы
+}
+
+static void apply_stream(d3ddev *d, u32 n, d3dbuf *b, u32 stride)
+{
+    if (n >= MAX_STREAMS)
+        return;
+    if (b != d->stream[n]) {
+        if (b)
+            com_addref(b->obj);
+        if (d->stream[n])
+            com_release(d->stream[n]->obj);
+        d->stream[n] = b;
+    }
+    d->stride[n] = stride;
+}
+
+static void apply_indices(d3ddev *d, d3dbuf *b, u32 base_vertex)
+{
+    if (b != d->indices) {
+        if (b)
+            com_addref(b->obj);
+        if (d->indices)
+            com_release(d->indices->obj);
+        d->indices = b;
+    }
+    d->base_vertex = base_vertex;
+}
+
+static void apply_xf(d3ddev *d, u32 state, const float *mat)
+{
+    if (state == 2) {
+        memcpy(d->view, mat, 64);
+        d->gen_xf++;
+        d->gen_view++;
+    } else if (state == 3) {
+        memcpy(d->proj, mat, 64);
+        d->gen_xf++;
+    } else if (state == 256) {
+        memcpy(d->world, mat, 64);
+        d->gen_xf++;
+    } else if (state >= 16 && state < 16 + MAX_STAGES) {
+        memcpy(d->texm[state - 16], mat, 64);
+        d->gen_texm++;
+    }
+}
+
+struct d3d_sb {
+    u32 rs_mask[8];
+    u32 rs[256];
+    u32 tss_mask[MAX_STAGES];
+    u32 tss[MAX_STAGES][32];
+    u8 tex_mask;
+    d3dtex *tex[MAX_STAGES];      // удерживает ссылку COM
+    u8 xf_view, xf_proj, xf_world, xf_texm_mask;
+    float view[16], proj[16], world[16], texm[MAX_STAGES][16];
+    u8 has_vp, has_mat, has_vs, has_ps, has_indices;
+    u32 vp[4];
+    float vpz[2];
+    float material[17];
+    u8 light_mask, light_en_mask;
+    d3dlight lights[MAX_LIGHTS];
+    u8 light_on[MAX_LIGHTS], light_set[MAX_LIGHTS];
+    u8 clip_mask;
+    float clip[6][4];
+    u16 stream_mask;
+    d3dbuf *stream[MAX_STREAMS];  // удерживает ссылку COM
+    u32 stride[MAX_STREAMS];
+    d3dbuf *indices;              // удерживает ссылку COM
+    u32 base_vertex;
+    u32 vs, ps;
+    u32 vsc_mask[3];
+    float vsc[96][4];
+    u8 psc_mask;
+    float psc[8][4];
+};
+
+static inline void sb_set_rs_bit(d3d_sb *s, u32 st)
+{
+    if (st < 256)
+        s->rs_mask[st >> 5] |= 1u << (st & 31);
+}
+
+static inline int sb_has_rs(const d3d_sb *s, u32 st) { return (s->rs_mask[st >> 5] & (1u << (st & 31))) != 0; }
+
+static void sb_set_tex(d3d_sb *s, u32 stage, d3dtex *t)
+{
+    if (stage >= MAX_STAGES)
+        return;
+    if (t)
+        com_addref(t->obj);
+    if (s->tex[stage])
+        com_release(s->tex[stage]->obj);
+    s->tex[stage] = t;
+    s->tex_mask |= (u8)(1u << stage);
+}
+
+static void sb_set_stream(d3d_sb *s, u32 n, d3dbuf *b, u32 stride)
+{
+    if (n >= MAX_STREAMS)
+        return;
+    if (b)
+        com_addref(b->obj);
+    if (s->stream[n])
+        com_release(s->stream[n]->obj);
+    s->stream[n] = b;
+    s->stride[n] = stride;
+    s->stream_mask |= (u16)(1u << n);
+}
+
+static void sb_set_indices(d3d_sb *s, d3dbuf *b, u32 base_vertex)
+{
+    if (b)
+        com_addref(b->obj);
+    if (s->indices)
+        com_release(s->indices->obj);
+    s->indices = b;
+    s->base_vertex = base_vertex;
+    s->has_indices = 1;
+}
+
+static void sb_free(d3d_sb *s)
+{
+    if (!s)
+        return;
+    for (int i = 0; i < MAX_STAGES; i++)
+        if (s->tex[i])
+            com_release(s->tex[i]->obj);
+    for (int i = 0; i < MAX_STREAMS; i++)
+        if (s->stream[i])
+            com_release(s->stream[i]->obj);
+    if (s->indices)
+        com_release(s->indices->obj);
+    free(s);
+}
+
+static void sb_destroy_all(d3ddev *d)
+{
+    sb_free(d->rec_sb);
+    d->rec_sb = NULL;
+    for (u32 i = 0; i < d->sb_cap; i++) {
+        sb_free(d->sb[i]);
+        d->sb[i] = NULL;
+    }
+    free(d->sb);
+    d->sb = NULL;
+    d->sb_cap = 0;
+}
+
+static void sb_capture(d3ddev *d, d3d_sb *s)
+{
+    for (u32 st = 0; st < 256; st++)
+        if (sb_has_rs(s, st))
+            s->rs[st] = d->rs[st];
+    for (int stg = 0; stg < MAX_STAGES; stg++) {
+        u32 m = s->tss_mask[stg];
+        for (u32 t = 0; m && t < 32; t++)
+            if (m & (1u << t))
+                s->tss[stg][t] = d->tss[stg][t];
+        if (s->tex_mask & (1u << stg))
+            sb_set_tex(s, (u32)stg, d->tex[stg]);
+    }
+    if (s->xf_view)
+        memcpy(s->view, d->view, 64);
+    if (s->xf_proj)
+        memcpy(s->proj, d->proj, 64);
+    if (s->xf_world)
+        memcpy(s->world, d->world, 64);
+    for (int stg = 0; stg < MAX_STAGES; stg++)
+        if (s->xf_texm_mask & (1u << stg))
+            memcpy(s->texm[stg], d->texm[stg], 64);
+    if (s->has_vp) {
+        memcpy(s->vp, d->vp, sizeof s->vp);
+        memcpy(s->vpz, d->vpz, sizeof s->vpz);
+    }
+    if (s->has_mat)
+        memcpy(s->material, d->material, sizeof s->material);
+    for (int i = 0; i < MAX_LIGHTS; i++) {
+        if (s->light_mask & (1u << i)) {
+            s->lights[i] = d->lights[i];
+            s->light_set[i] = d->light_set[i];
+        }
+        if (s->light_en_mask & (1u << i))
+            s->light_on[i] = d->light_on[i];
+    }
+    for (int i = 0; i < 6; i++)
+        if (s->clip_mask & (1u << i))
+            memcpy(s->clip[i], d->clip[i], 16);
+    for (u32 n = 0; n < MAX_STREAMS; n++)
+        if (s->stream_mask & (1u << n))
+            sb_set_stream(s, n, d->stream[n], d->stride[n]);
+    if (s->has_indices)
+        sb_set_indices(s, d->indices, d->base_vertex);
+    if (s->has_vs)
+        s->vs = d->vs;
+    if (s->has_ps)
+        s->ps = d->ps;
+    for (u32 i = 0; i < 96; i++)
+        if (s->vsc_mask[i >> 5] & (1u << (i & 31)))
+            memcpy(s->vsc[i], d->vsc[i], 16);
+    for (u32 i = 0; i < 8; i++)
+        if (s->psc_mask & (1u << i))
+            memcpy(s->psc[i], d->psc[i], 16);
+}
+
+static void sb_apply(d3ddev *d, const d3d_sb *s)
+{
+    for (u32 st = 0; st < 256; st++)
+        if (sb_has_rs(s, st))
+            apply_rs(d, st, s->rs[st]);
+    for (int stg = 0; stg < MAX_STAGES; stg++) {
+        u32 m = s->tss_mask[stg];
+        for (u32 t = 0; m && t < 32; t++)
+            if (m & (1u << t))
+                apply_tss(d, (u32)stg, t, s->tss[stg][t]);
+        if (s->tex_mask & (1u << stg))
+            apply_tex(d, (u32)stg, s->tex[stg]);
+    }
+    if (s->xf_view)
+        apply_xf(d, 2, s->view);
+    if (s->xf_proj)
+        apply_xf(d, 3, s->proj);
+    if (s->xf_world)
+        apply_xf(d, 256, s->world);
+    for (int stg = 0; stg < MAX_STAGES; stg++)
+        if (s->xf_texm_mask & (1u << stg))
+            apply_xf(d, 16u + (u32)stg, s->texm[stg]);
+    if (s->has_vp) {
+        memcpy(d->vp, s->vp, sizeof d->vp);
+        memcpy(d->vpz, s->vpz, sizeof d->vpz);
+        d->gen_vp++;
+        d->gl_dirty |= GLD_VP;
+    }
+    if (s->has_mat) {
+        memcpy(d->material, s->material, sizeof d->material);
+        d->gen_mat++;
+    }
+    int light_ch = 0;
+    for (int i = 0; i < MAX_LIGHTS; i++) {
+        if (s->light_mask & (1u << i)) {
+            d->lights[i] = s->lights[i];
+            d->light_set[i] = s->light_set[i];
+            light_ch = 1;
+        }
+        if (s->light_en_mask & (1u << i)) {
+            d->light_on[i] = s->light_on[i];
+            light_ch = 1;
+        }
+    }
+    if (light_ch)
+        d->gen_light++;
+    if (s->clip_mask) {
+        for (int i = 0; i < 6; i++)
+            if (s->clip_mask & (1u << i))
+                memcpy(d->clip[i], s->clip[i], 16);
+        d->gen_clip++;
+    }
+    for (u32 n = 0; n < MAX_STREAMS; n++)
+        if (s->stream_mask & (1u << n))
+            apply_stream(d, n, s->stream[n], s->stride[n]);
+    if (s->has_indices)
+        apply_indices(d, s->indices, s->base_vertex);
+    if (s->has_vs)
+        d->vs = s->vs;
+    if (s->has_ps)
+        d->ps = s->ps;
+    for (u32 i = 0; i < 96; i++)
+        if (s->vsc_mask[i >> 5] & (1u << (i & 31)))
+            memcpy(d->vsc[i], s->vsc[i], 16);
+    if (s->psc_mask) {
+        for (u32 i = 0; i < 8; i++)
+            if (s->psc_mask & (1u << i))
+                memcpy(d->psc[i], s->psc[i], 16);
+        d->gen_psc++;
+    }
+}
+
+static u32 sb_store(d3ddev *d, d3d_sb *s)
+{
+    for (u32 i = 0; i < d->sb_cap; i++)
+        if (!d->sb[i]) {
+            d->sb[i] = s;
+            return i + 1u;
+        }
+    u32 ncap = d->sb_cap ? d->sb_cap * 2u : 64u;
+    d3d_sb **nb = realloc(d->sb, (size_t)ncap * sizeof *nb);
+    if (!nb)
+        return 0;
+    memset(nb + d->sb_cap, 0, (size_t)(ncap - d->sb_cap) * sizeof *nb);
+    u32 idx = d->sb_cap;
+    d->sb = nb;
+    d->sb_cap = ncap;
+    d->sb[idx] = s;
+    return idx + 1u;
+}
+
+static d3d_sb *sb_get(d3ddev *d, u32 tok)
+{
+    return tok && tok <= d->sb_cap ? d->sb[tok - 1u] : NULL;
+}
+
+static void sb_init_type(d3d_sb *s, u32 type)
+{
+    static const u8 pixel_rs[] = {
+        7, 8, 9, 10, 14, 15, 16, 19, 20, 23, 24, 25, 26, 27, 28, 29, 30, 34, 35, 36, 37, 38, 40, 47, 52, 53, 54,
+        55, 56, 57, 58, 59, 60, 128, 129, 130, 131, 132, 133, 134, 135, 168, 171,
+    };
+    static const u8 vertex_rs[] = {
+        9, 22, 28, 29, 34, 36, 37, 38, 48, 136, 137, 139, 140, 141, 142, 143, 145, 146, 147, 148, 151, 152, 153,
+        154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 166, 167, 170, 172, 173,
+    };
+    if (type == 1) {  // D3DSBT_ALL
+        memset(s->rs_mask, 0xFF, sizeof s->rs_mask);
+        for (int i = 0; i < MAX_STAGES; i++)
+            s->tss_mask[i] = 0xFFFFFFFFu;
+        s->tex_mask = 0xFF;
+        s->xf_view = s->xf_proj = s->xf_world = 1;
+        s->xf_texm_mask = 0xFF;
+        s->has_vp = s->has_mat = s->has_vs = s->has_ps = s->has_indices = 1;
+        s->light_mask = s->light_en_mask = 0xFF;
+        s->clip_mask = 0x3F;
+        s->stream_mask = 0xFFFF;
+        s->vsc_mask[0] = s->vsc_mask[1] = s->vsc_mask[2] = 0xFFFFFFFFu;
+        s->psc_mask = 0xFF;
+    } else if (type == 2) {  // D3DSBT_PIXELSTATE
+        for (size_t i = 0; i < sizeof pixel_rs; i++)
+            sb_set_rs_bit(s, pixel_rs[i]);
+        // Все TSS, кроме TEXCOORDINDEX (11) и TEXTURETRANSFORMFLAGS (24)
+        u32 ptss = 0xFFFFFFFFu & ~(1u << 11) & ~(1u << 24);
+        for (int i = 0; i < MAX_STAGES; i++)
+            s->tss_mask[i] = ptss;
+        s->tex_mask = 0xFF;
+        s->has_ps = 1;
+        s->psc_mask = 0xFF;
+    } else if (type == 3) {  // D3DSBT_VERTEXSTATE
+        for (size_t i = 0; i < sizeof vertex_rs; i++)
+            sb_set_rs_bit(s, vertex_rs[i]);
+        u32 vtss = (1u << 11) | (1u << 24);
+        for (int i = 0; i < MAX_STAGES; i++)
+            s->tss_mask[i] = vtss;
+        s->xf_view = s->xf_proj = s->xf_world = 1;
+        s->xf_texm_mask = 0xFF;
+        s->has_vp = s->has_mat = s->has_vs = s->has_indices = 1;
+        s->light_mask = s->light_en_mask = 0xFF;
+        s->clip_mask = 0x3F;
+        s->stream_mask = 0xFFFF;
+        s->vsc_mask[0] = s->vsc_mask[1] = s->vsc_mask[2] = 0xFFFFFFFFu;
+    }
 }
 
 // ================================================================ вершинные объявления
@@ -410,13 +825,32 @@ static void dev_GetRasterStatus(CPU *c)
     RET(2, D3D_OK);
 }
 
-static void dev_SetGammaRamp(CPU *c) { RET(3, 0); }  // TODO: гамма — коррекцией при Present
-
-static void dev_GetGammaRamp(CPU *c)
+static void dev_SetGammaRamp(CPU *c)  // (Flags, pRamp) — возвращает void
 {
-    for (u32 i = 0; i < 256; i++)
+    d3ddev *d = DEV(c);
+    u32 p = ARG(2);
+    if (p >= 0x1000u && p <= RT_WINDOW - 1536u) {
+        u16 ramp[3][256];
         for (u32 ch = 0; ch < 3; ch++)
-            wr16(g_mem, ARG(1) + ch * 512 + i * 2, (u16)(i * 257));
+            for (u32 i = 0; i < 256; i++)
+                ramp[ch][i] = rd16(g_mem, p + ch * 512u + i * 2u);
+        if (memcmp(d->gamma, ramp, sizeof ramp) != 0) {
+            memcpy(d->gamma, ramp, sizeof ramp);
+            d->gamma_dirty = 1;
+        }
+    }
+    RET(3, 0);
+}
+
+static void dev_GetGammaRamp(CPU *c)  // (pRamp) — возвращает void
+{
+    d3ddev *d = DEV(c);
+    u32 p = ARG(1);
+    if (p >= 0x1000u && p <= RT_WINDOW - 1536u) {
+        for (u32 ch = 0; ch < 3; ch++)
+            for (u32 i = 0; i < 256; i++)
+                wr16(g_mem, p + ch * 512u + i * 2u, d->gamma[ch][i]);
+    }
     RET(2, 0);
 }
 
@@ -484,6 +918,28 @@ static void dev_CreateImageSurface(CPU *c)
     d3dsurf *s = d3d8_surf_create(ARG(1), ARG(2), ARG(3), 0, POOL_SYSTEMMEM);
     wr32(g_mem, ARG(4), s ? s->obj : 0);
     RET(5, s ? D3D_OK : D3DERR_INVALIDCALL);
+}
+
+// CopyRects(pSourceSurface, pSourceRectsArray, cRects, pDestinationSurface, pDestPointsArray)
+static void dev_CopyRects(CPU *c)
+{
+    d3dsurf *src = d3d8_surf_from(ARG(1)), *dst = d3d8_surf_from(ARG(4));
+    RET(6, d3d8_copy_rects(src, dst, ARG(2), ARG(3), ARG(5)));
+}
+
+// UpdateTexture(pSourceTexture, pDestinationTexture)
+static void dev_UpdateTexture(CPU *c)
+{
+    d3dtex *src = d3d8_tex_from(ARG(1)), *dst = d3d8_tex_from(ARG(2));
+    RET(3, d3d8_update_texture(src, dst));
+}
+
+// GetFrontBuffer(pDestSurface)
+static void dev_GetFrontBuffer(CPU *c)
+{
+    d3ddev *d = DEV(c);
+    d3dsurf *dst = d3d8_surf_from(ARG(1));
+    RET(2, d3d8_copy_surface(d->backbuffer, dst));
 }
 
 // SetRenderTarget(pRenderTarget, pNewZStencil): устройство держит ссылки на цели
@@ -576,7 +1032,13 @@ static void dev_Clear(CPU *c)
                 glClear(mask);
             }
         }
-        d->gen_misc++;  // маски записи и scissor переустанавливаются перед следующей отрисовкой
+        d->gl_dirty |= GLD_SCISSOR;
+        if (flags & 1)
+            d->gl_dirty |= GLD_COLORMASK;
+        if ((flags & 2) && d->ds)
+            d->gl_dirty |= GLD_DEPTH;
+        if ((flags & 4) && d->ds)
+            d->gl_dirty |= GLD_STENCIL;
     }
     RET(7, D3D_OK);
 }
@@ -597,11 +1059,29 @@ static float *xf_slot(d3ddev *d, u32 state)
 static void dev_SetTransform(CPU *c)
 {
     d3ddev *d = DEV(c);
-    float *m = xf_slot(d, ARG(1));
-    if (m) {
-        memcpy(m, g_mem + ARG(2), 64);
-        d->gen_xf++;
+    u32 st = ARG(1);
+    if (!xf_slot(d, st))
+        RET(3, D3D_OK);
+    float mat[16];
+    memcpy(mat, g_mem + ARG(2), 64);
+    if (d->rec_sb) {
+        d3d_sb *sb = d->rec_sb;
+        if (st == 2) {
+            memcpy(sb->view, mat, 64);
+            sb->xf_view = 1;
+        } else if (st == 3) {
+            memcpy(sb->proj, mat, 64);
+            sb->xf_proj = 1;
+        } else if (st == 256) {
+            memcpy(sb->world, mat, 64);
+            sb->xf_world = 1;
+        } else if (st >= 16 && st < 16 + MAX_STAGES) {
+            memcpy(sb->texm[st - 16], mat, 64);
+            sb->xf_texm_mask |= (u8)(1u << (st - 16));
+        }
+        RET(3, D3D_OK);
     }
+    apply_xf(d, st, mat);
     RET(3, D3D_OK);
 }
 
@@ -620,14 +1100,14 @@ static void dev_GetTransform(CPU *c)
 static void dev_MultiplyTransform(CPU *c)
 {
     d3ddev *d = DEV(c);
-    float *m = xf_slot(d, ARG(1)), b[16], r[16];
+    u32 st = ARG(1);
+    float *m = xf_slot(d, st), b[16], r[16];
     if (m) {
         memcpy(b, g_mem + ARG(2), 64);
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++)
                 r[i * 4 + j] = m[i * 4] * b[j] + m[i * 4 + 1] * b[4 + j] + m[i * 4 + 2] * b[8 + j] + m[i * 4 + 3] * b[12 + j];
-        memcpy(m, r, 64);
-        d->gen_xf++;
+        apply_xf(d, st, r);
     }
     RET(3, D3D_OK);
 }
@@ -636,13 +1116,24 @@ static void dev_MultiplyTransform(CPU *c)
 static void dev_SetViewport(CPU *c)
 {
     d3ddev *d = DEV(c);
+    u32 vp[4];
+    float vpz[2];
     for (int i = 0; i < 4; i++)
-        d->vp[i] = rd32(g_mem, ARG(1) + 4u * (u32)i);
-    d->vpz[0] = rdf(ARG(1) + 16);
-    d->vpz[1] = rdf(ARG(1) + 20);
+        vp[i] = rd32(g_mem, ARG(1) + 4u * (u32)i);
+    vpz[0] = rdf(ARG(1) + 16);
+    vpz[1] = rdf(ARG(1) + 20);
+    if (d->rec_sb) {
+        memcpy(d->rec_sb->vp, vp, sizeof vp);
+        memcpy(d->rec_sb->vpz, vpz, sizeof vpz);
+        d->rec_sb->has_vp = 1;
+        RET(2, D3D_OK);
+    }
+    memcpy(d->vp, vp, sizeof vp);
+    memcpy(d->vpz, vpz, sizeof vpz);
     if (d3d8_dumping(d))
         fprintf(stderr, "[dump] SetViewport %u,%u %ux%u\n", d->vp[0], d->vp[1], d->vp[2], d->vp[3]);
-    d->gen_misc++;
+    d->gen_vp++;
+    d->gl_dirty |= GLD_VP;
     RET(2, D3D_OK);
 }
 
@@ -659,6 +1150,11 @@ static void dev_GetViewport(CPU *c)
 static void dev_SetMaterial(CPU *c)
 {
     d3ddev *d = DEV(c);
+    if (d->rec_sb) {
+        memcpy(d->rec_sb->material, g_mem + ARG(1), sizeof d->rec_sb->material);
+        d->rec_sb->has_mat = 1;
+        RET(2, D3D_OK);
+    }
     memcpy(d->material, g_mem + ARG(1), sizeof d->material);
     d->gen_mat++;
     RET(2, D3D_OK);
@@ -675,6 +1171,12 @@ static void dev_SetLight(CPU *c)
     d3ddev *d = DEV(c);
     u32 i = ARG(1);
     if (i < MAX_LIGHTS) {
+        if (d->rec_sb) {
+            memcpy(&d->rec_sb->lights[i], g_mem + ARG(2), sizeof(d3dlight));
+            d->rec_sb->light_set[i] = 1;
+            d->rec_sb->light_mask |= (u8)(1u << i);
+            RET(3, D3D_OK);
+        }
         memcpy(&d->lights[i], g_mem + ARG(2), sizeof(d3dlight));
         d->light_set[i] = 1;
         d->gen_light++;
@@ -697,6 +1199,11 @@ static void dev_LightEnable(CPU *c)
     d3ddev *d = DEV(c);
     u32 i = ARG(1);
     if (i < MAX_LIGHTS) {
+        if (d->rec_sb) {
+            d->rec_sb->light_on[i] = ARG(2) != 0;
+            d->rec_sb->light_en_mask |= (u8)(1u << i);
+            RET(3, D3D_OK);
+        }
         if (!d->light_set[i]) {  // как D3D: включение незаданного источника — белый направленный (0,0,1)
             memset(&d->lights[i], 0, sizeof(d3dlight));
             d->lights[i].type = 3;
@@ -720,9 +1227,15 @@ static void dev_GetLightEnable(CPU *c)
 static void dev_SetClipPlane(CPU *c)
 {
     d3ddev *d = DEV(c);
-    if (ARG(1) < 6) {
-        memcpy(d->clip[ARG(1)], g_mem + ARG(2), 16);
-        d->gen_misc++;
+    u32 i = ARG(1);
+    if (i < 6) {
+        if (d->rec_sb) {
+            memcpy(d->rec_sb->clip[i], g_mem + ARG(2), 16);
+            d->rec_sb->clip_mask |= (u8)(1u << i);
+            RET(3, D3D_OK);
+        }
+        memcpy(d->clip[i], g_mem + ARG(2), 16);
+        d->gen_clip++;
     }
     RET(3, D3D_OK);
 }
@@ -738,16 +1251,103 @@ static void dev_GetClipPlane(CPU *c)
 static void dev_SetRenderState(CPU *c)
 {
     d3ddev *d = DEV(c);
-    if (ARG(1) < 256 && d->rs[ARG(1)] != ARG(2)) {
-        d->rs[ARG(1)] = ARG(2);
-        d->gen_misc++;
+    u32 st = ARG(1), val = ARG(2);
+    if (d->rec_sb) {
+        if (st < 256) {
+            d->rec_sb->rs[st] = val;
+            sb_set_rs_bit(d->rec_sb, st);
+        }
+        RET(3, D3D_OK);
     }
+    apply_rs(d, st, val);
     RET(3, D3D_OK);
 }
 
 static void dev_GetRenderState(CPU *c)
 {
     wr32(g_mem, ARG(2), ARG(1) < 256 ? DEV(c)->rs[ARG(1)] : 0);
+    RET(3, D3D_OK);
+}
+
+// ---------------------------------------------------------------- StateBlocks (слоты 52..57)
+static void dev_BeginStateBlock(CPU *c)
+{
+    d3ddev *d = DEV(c);
+    if (d->rec_sb)
+        RET(1, D3DERR_INVALIDCALL);
+    d->rec_sb = calloc(1, sizeof *d->rec_sb);
+    RET(1, d->rec_sb ? D3D_OK : E_OUTOFMEMORY);
+}
+
+static void dev_EndStateBlock(CPU *c)  // (pToken)
+{
+    d3ddev *d = DEV(c);
+    if (!d->rec_sb || !ARG(1)) {
+        sb_free(d->rec_sb);
+        d->rec_sb = NULL;
+        RET(2, D3DERR_INVALIDCALL);
+    }
+    u32 tok = sb_store(d, d->rec_sb);
+    if (!tok) {
+        sb_free(d->rec_sb);
+        d->rec_sb = NULL;
+        wr32(g_mem, ARG(1), 0);
+        RET(2, E_OUTOFMEMORY);
+    }
+    d->rec_sb = NULL;
+    wr32(g_mem, ARG(1), tok);
+    RET(2, D3D_OK);
+}
+
+static void dev_ApplyStateBlock(CPU *c)  // (Token)
+{
+    d3ddev *d = DEV(c);
+    d3d_sb *s = sb_get(d, ARG(1));
+    if (d->rec_sb || !s)
+        RET(2, D3DERR_INVALIDCALL);
+    sb_apply(d, s);
+    RET(2, D3D_OK);
+}
+
+static void dev_CaptureStateBlock(CPU *c)  // (Token)
+{
+    d3ddev *d = DEV(c);
+    d3d_sb *s = sb_get(d, ARG(1));
+    if (d->rec_sb || !s)
+        RET(2, D3DERR_INVALIDCALL);
+    sb_capture(d, s);
+    RET(2, D3D_OK);
+}
+
+static void dev_DeleteStateBlock(CPU *c)  // (Token)
+{
+    d3ddev *d = DEV(c);
+    u32 tok = ARG(1);
+    if (!tok || tok > d->sb_cap || !d->sb[tok - 1u])
+        RET(2, D3DERR_INVALIDCALL);
+    sb_free(d->sb[tok - 1u]);
+    d->sb[tok - 1u] = NULL;
+    RET(2, D3D_OK);
+}
+
+static void dev_CreateStateBlock(CPU *c)  // (Type, pToken)
+{
+    d3ddev *d = DEV(c);
+    u32 type = ARG(1), out = ARG(2);
+    if (d->rec_sb || !out || type < 1 || type > 3)
+        RET(3, D3DERR_INVALIDCALL);
+    d3d_sb *s = calloc(1, sizeof *s);
+    if (!s)
+        RET(3, E_OUTOFMEMORY);
+    sb_init_type(s, type);
+    sb_capture(d, s);
+    u32 tok = sb_store(d, s);
+    if (!tok) {
+        sb_free(s);
+        wr32(g_mem, out, 0);
+        RET(3, E_OUTOFMEMORY);
+    }
+    wr32(g_mem, out, tok);
     RET(3, D3D_OK);
 }
 
@@ -776,14 +1376,11 @@ static void dev_SetTexture(CPU *c)
     if (s >= MAX_STAGES)
         RET(3, D3D_OK);
     d3dtex *t = d3d8_tex_from(ARG(2));
-    if (t != d->tex[s]) {
-        if (t)
-            com_addref(t->obj);
-        if (d->tex[s])
-            com_release(d->tex[s]->obj);
-        d->tex[s] = t;
-        d->gen_misc++;
+    if (d->rec_sb) {
+        sb_set_tex(d->rec_sb, s, t);
+        RET(3, D3D_OK);
     }
+    apply_tex(d, s, t);
     RET(3, D3D_OK);
 }
 
@@ -797,13 +1394,15 @@ static void dev_GetTextureStageState(CPU *c)
 static void dev_SetTextureStageState(CPU *c)
 {
     d3ddev *d = DEV(c);
-    u32 s = ARG(1), t = ARG(2);
-    if (s < MAX_STAGES && t < 32 && d->tss[s][t] != ARG(3)) {
-        d->tss[s][t] = ARG(3);
-        d->gen_misc++;
-        if ((t >= 13 && t <= 21) || t == 25)
-            d->sampler_dirty |= 1u << s;
+    u32 s = ARG(1), t = ARG(2), val = ARG(3);
+    if (d->rec_sb) {
+        if (s < MAX_STAGES && t < 32) {
+            d->rec_sb->tss[s][t] = val;
+            d->rec_sb->tss_mask[s] |= 1u << t;
+        }
+        RET(4, D3D_OK);
     }
+    apply_tss(d, s, t, val);
     RET(4, D3D_OK);
 }
 
@@ -862,6 +1461,10 @@ static void dev_DrawIndexedPrimitiveUP(CPU *c)
 
 // ---------------------------------------------------------------- шейдеры
 // CreateVertexShader(pDeclaration, pFunction, pHandle, Usage)
+// Проверено по D3DDrv.dll: UD3DRenderDevice::GetVertexShader (D3DDrv.dll!0x12811fb0) поддерживает только
+// VS_FixedFunction (0) и единственный вызов CreateVertexShader (D3DDrv.dll!0x12826353) всегда передаёт
+// pFunction == 0; программируемых vs.1.1 в Shrek 2 нет (CreateVolumeTexture встречается только в недостижимом
+// статическом d3dx8.lib).
 static void dev_CreateVertexShader(CPU *c)
 {
     d3ddev *d = DEV(c);
@@ -884,10 +1487,12 @@ static void dev_CreateVertexShader(CPU *c)
 static void dev_SetVertexShader(CPU *c)
 {
     d3ddev *d = DEV(c);
-    if (d->vs != ARG(1)) {
-        d->vs = ARG(1);
-        d->gen_misc++;
+    if (d->rec_sb) {
+        d->rec_sb->vs = ARG(1);
+        d->rec_sb->has_vs = 1;
+        RET(2, D3D_OK);
     }
+    d->vs = ARG(1);  // влияет только на vdecl / ffkey
     RET(2, D3D_OK);
 }
 
@@ -910,6 +1515,14 @@ static void dev_DeleteVertexShader(CPU *c)
 static void dev_SetVertexShaderConstant(CPU *c)  // (Register, pConstantData, ConstantCount)
 {
     d3ddev *d = DEV(c);
+    if (d->rec_sb) {
+        for (u32 i = 0; i < ARG(3) && ARG(1) + i < 96; i++) {
+            u32 r = ARG(1) + i;
+            memcpy(d->rec_sb->vsc[r], g_mem + ARG(2) + 16 * i, 16);
+            d->rec_sb->vsc_mask[r >> 5] |= 1u << (r & 31);
+        }
+        RET(4, D3D_OK);
+    }
     for (u32 i = 0; i < ARG(3) && ARG(1) + i < 96; i++)
         memcpy(d->vsc[ARG(1) + i], g_mem + ARG(2) + 16 * i, 16);
     RET(4, D3D_OK);
@@ -930,14 +1543,11 @@ static void dev_SetStreamSource(CPU *c)  // (StreamNumber, pStreamData, Stride)
     if (n >= MAX_STREAMS)
         RET(4, D3DERR_INVALIDCALL);
     d3dbuf *b = d3d8_buf_from(ARG(2));
-    if (b != d->stream[n]) {
-        if (b)
-            com_addref(b->obj);
-        if (d->stream[n])
-            com_release(d->stream[n]->obj);
-        d->stream[n] = b;
+    if (d->rec_sb) {
+        sb_set_stream(d->rec_sb, n, b, ARG(3));
+        RET(4, D3D_OK);
     }
-    d->stride[n] = ARG(3);
+    apply_stream(d, n, b, ARG(3));
     RET(4, D3D_OK);
 }
 
@@ -957,14 +1567,11 @@ static void dev_SetIndices(CPU *c)  // (pIndexData, BaseVertexIndex)
 {
     d3ddev *d = DEV(c);
     d3dbuf *b = d3d8_buf_from(ARG(1));
-    if (b != d->indices) {
-        if (b)
-            com_addref(b->obj);
-        if (d->indices)
-            com_release(d->indices->obj);
-        d->indices = b;
+    if (d->rec_sb) {
+        sb_set_indices(d->rec_sb, b, ARG(2));
+        RET(3, D3D_OK);
     }
-    d->base_vertex = ARG(2);
+    apply_indices(d, b, ARG(2));
     RET(3, D3D_OK);
 }
 
@@ -988,10 +1595,12 @@ static void dev_CreatePixelShader(CPU *c)  // (pFunction, pHandle)
 static void dev_SetPixelShader(CPU *c)
 {
     d3ddev *d = DEV(c);
-    if (d->ps != ARG(1)) {
-        d->ps = ARG(1);
-        d->gen_misc++;
+    if (d->rec_sb) {
+        d->rec_sb->ps = ARG(1);
+        d->rec_sb->has_ps = 1;
+        RET(2, D3D_OK);
     }
+    d->ps = ARG(1);  // влияет только на ffkey
     RET(2, D3D_OK);
 }
 
@@ -1010,9 +1619,17 @@ static void dev_DeletePixelShader(CPU *c)
 static void dev_SetPixelShaderConstant(CPU *c)  // (Register, pConstantData, ConstantCount)
 {
     d3ddev *d = DEV(c);
+    if (d->rec_sb) {
+        for (u32 i = 0; i < ARG(3) && ARG(1) + i < 8; i++) {
+            u32 r = ARG(1) + i;
+            memcpy(d->rec_sb->psc[r], g_mem + ARG(2) + 16 * i, 16);
+            d->rec_sb->psc_mask |= (u8)(1u << r);
+        }
+        RET(4, D3D_OK);
+    }
     for (u32 i = 0; i < ARG(3) && ARG(1) + i < 8; i++)
         memcpy(d->psc[ARG(1) + i], g_mem + ARG(2) + 16 * i, 16);
-    d->gen_misc++;
+    d->gen_psc++;
     RET(4, D3D_OK);
 }
 
@@ -1032,6 +1649,7 @@ static void dev_destroy(void *p)
 {
     d3ddev *d = p;
     d->obj = 0;
+    sb_destroy_all(d);
     for (int s = 0; s < MAX_STAGES; s++)
         if (d->tex[s]) {
             com_release(d->tex[s]->obj);
@@ -1046,7 +1664,7 @@ static void dev_destroy(void *p)
         com_release(d->indices->obj);
         d->indices = NULL;
     }
-    d->gen_misc++;
+    d->gl_dirty = GLD_ALL;
 }
 
 static void init_vtable(void)
@@ -1075,14 +1693,16 @@ static void init_vtable(void)
     m[18] = dev_SetGammaRamp;
     m[19] = dev_GetGammaRamp;
     m[20] = dev_CreateTexture;
-    // 21 CreateVolumeTexture
+    // 21 CreateVolumeTexture (в D3DDrv.dll не используется)
     m[22] = dev_CreateCubeTexture;
     m[23] = dev_CreateVertexBuffer;
     m[24] = dev_CreateIndexBuffer;
     m[25] = dev_CreateRenderTarget;
     m[26] = dev_CreateDepthStencilSurface;
     m[27] = dev_CreateImageSurface;
-    // 28 CopyRects, 29 UpdateTexture, 30 GetFrontBuffer
+    m[28] = dev_CopyRects;
+    m[29] = dev_UpdateTexture;
+    m[30] = dev_GetFrontBuffer;
     m[31] = dev_SetRenderTarget;
     m[32] = dev_GetRenderTarget;
     m[33] = dev_GetDepthStencilSurface;
@@ -1104,7 +1724,12 @@ static void init_vtable(void)
     m[49] = dev_GetClipPlane;
     m[50] = dev_SetRenderState;
     m[51] = dev_GetRenderState;
-    // 52..57 state blocks
+    m[52] = dev_BeginStateBlock;
+    m[53] = dev_EndStateBlock;
+    m[54] = dev_ApplyStateBlock;
+    m[55] = dev_CaptureStateBlock;
+    m[56] = dev_DeleteStateBlock;
+    m[57] = dev_CreateStateBlock;
     m[58] = dev_SetClipStatus;
     m[59] = dev_GetClipStatus;
     m[60] = dev_GetTexture;
@@ -1244,6 +1869,10 @@ u32 d3d8_device_create(CPU *c, u32 hwnd, u32 pp)
     }
     d->obj = com_create(g_vt_dev, d, dev_destroy);
     g_dev = d;
+    for (u32 ch = 0; ch < 3; ch++)
+        for (u32 i = 0; i < 256; i++)
+            d->gamma[ch][i] = (u16)(i * 257u);
+    d->gamma_dirty = 1;
     d3d8_res_init(d->obj);
     glGenVertexArrays(1, &d->vao);
     glBindVertexArray(d->vao);

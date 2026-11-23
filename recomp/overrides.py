@@ -33,6 +33,10 @@ for _m in ["Engine.dll", "D3DDrv.dll", "ALAudio.dll", "Fire.dll", "GUI.dll", "Ip
 # game.exe: FArchiveFileWriter::Serialize — копия в буфер архива без вызовов гостя
 SIGS["file_write"] = "53 8B 5C 24 0C 55 8B 6C 24 0C 56 8B F1 8B 56 48 8B 4E 4C 57 BF 00 10 00 00"
 WRAPS["game.exe!=file_write"] = ("ovr_launch_file_write", 0)
+# game.exe: FArchiveFileReader::Serialize — копия из буфера архива без вызовов гостя (runtime/overrides_launch.c)
+SIGS["file_read"] = ("56 57 8B 7C 24 10 85 FF 8B F1 0F 8E FF 00 00 00 53 55 8B 6C 24 14 "
+                     "8B 5E 54 8B 56 4C 8B 4E 50 2B DA 03 D9")
+WRAPS["game.exe!=file_read"] = ("ovr_launch_file_read", 0)
 # game.exe: FConfigCacheIni::GetString — по памяти кеша ini без вызовов гостя (runtime/overrides_core.c)
 SIGS["cfg_get_string"] = ("55 8B EC 6A FF 68 ? ? ? ? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 83 EC 18 8B 45 18 53 56 "
                           "57 8B 7D 10 33 DB 89 65 F0 53 50 89 5D FC 66 89 1F E8")
@@ -58,15 +62,56 @@ OVERRIDES["msvcr70.dll!rand"] = ("ovr_crt_rand", 0)
 OVERRIDES["msvcr70.dll!srand"] = ("ovr_crt_srand", 0)
 
 
-def _find_sig(img, sig):
+def _match_sig(img, sig):
     rx = re.compile(b"".join(b"." if p == "?" else re.escape(bytes([int(p, 16)])) for p in sig.split()), re.S)
     hits = []
     for s in img.code_sections():
         o = s.va - img.base
         hits += [s.va + m.start() for m in rx.finditer(bytes(img.data[o:o + s.vsize]))]
+    return hits
+
+
+def _find_sig(img, sig):
+    hits = _match_sig(img, sig)
     if len(hits) != 1:
         raise SystemExit(f"overrides: signature {sig!r} in {img.name}: {len(hits)} matches")
     return hits[0]
+
+
+def verify(prog):
+    """Проверить все сигнатуры и экспорты из OVERRIDES и WRAPS без аварийного выхода.
+
+    -> список (key, sym, status, detail), где status: 'ok' | 'missing_module' | 'missing_sig' | 'dup_sig' |
+       'missing_export' | 'unknown_sig'.
+    """
+    results = []
+    entries = list(OVERRIDES.items()) + list(WRAPS.items())
+    for key, (sym, _) in entries:
+        mod, name = key.split("!", 1)
+        img = prog.images.get(mod.lower())
+        if img is None:
+            results.append((key, sym, "missing_module", mod))
+            continue
+        if name.startswith("="):
+            sig_name = name[1:]
+            sig = SIGS.get(sig_name)
+            if sig is None:
+                results.append((key, sym, "unknown_sig", sig_name))
+                continue
+            hits = _match_sig(img, sig)
+            if len(hits) == 1:
+                results.append((key, sym, "ok", hits[0]))
+            elif len(hits) == 0:
+                results.append((key, sym, "missing_sig", 0))
+            else:
+                results.append((key, sym, "dup_sig", hits))
+        else:
+            va = img.exports.get(name)
+            if va is not None:
+                results.append((key, sym, "ok", va))
+            else:
+                results.append((key, sym, "missing_export", name))
+    return results
 
 
 def _addr(prog, key):

@@ -60,7 +60,8 @@ typedef struct d3dsurf {
     d3dtex *tex;           // контейнер (уровень текстуры) или NULL
     int face, level;
     u32 w, h, fmt, usage, pool;
-    GLuint rb;             // свой renderbuffer (цели рендера/глубина вне текстур)
+    GLuint rb;             // свой renderbuffer (глубина/трафарет вне текстур)
+    GLuint color_tex;      // своя 2D-текстура для цветовых целей рендера и заднего буфера (чтение в пост-проходе Present)
     u32 mem, pitch;        // гостевая память блокировки (у SYSTEMMEM-поверхностей — постоянная)
     u32 rb_mem;            // память блокировки цели рендера: заводится один раз (ReduceMouseLag — каждый кадр)
     int locked, own_mem;
@@ -100,11 +101,33 @@ d3dsurf *d3d8_surf_from(u32 obj);
 d3dbuf *d3d8_buf_from(u32 obj);
 void d3d8_buf_sync(d3dbuf *b);     // догрузить изменённое в GL
 void d3d8_res_init(u32 device_obj);  // vtables ресурсов; GetDevice возвращает device_obj
+// Прикрепить поверхность к FBO (уровень текстуры, color_tex цели рендера или renderbuffer)
+void d3d8_fbo_attach(GLenum fb_target, GLenum attachment, const d3dsurf *s);
+// CopyRects, GetFrontBuffer и UpdateTexture (поверх структур d3dsurf/d3dtex)
+u32 d3d8_copy_rects(d3dsurf *src, d3dsurf *dst, u32 src_rects_va, u32 count, u32 dst_pts_va);
+u32 d3d8_copy_surface(d3dsurf *src, d3dsurf *dst);  // копировать перекрывающуюся область (0,0)-(min w, min h)
+u32 d3d8_update_texture(d3dtex *src, d3dtex *dst);
 
 // ---------------------------------------------------------------- устройство
 #define MAX_STAGES 8
 #define MAX_STREAMS 16
 #define MAX_LIGHTS 8
+
+// Биты устаревшего фиксированного состояния GL (применяются побитно в apply_state)
+enum {
+    GLD_VP = 1u << 0,        // glViewport, glDepthRange
+    GLD_SCISSOR = 1u << 1,   // glDisable(GL_SCISSOR_TEST)
+    GLD_DEPTH = 1u << 2,     // GL_DEPTH_TEST, glDepthFunc, glDepthMask
+    GLD_BLEND = 1u << 3,     // GL_BLEND, glBlendFunc, glBlendEquation
+    GLD_CULL = 1u << 4,      // glFrontFace, GL_CULL_FACE, glCullFace
+    GLD_STENCIL = 1u << 5,   // GL_STENCIL_TEST, glStencilFunc/Op/Mask
+    GLD_COLORMASK = 1u << 6, // glColorMask
+    GLD_POLY = 1u << 7,      // glPolygonMode, GL_POLYGON_OFFSET_FILL/PolygonOffset
+    GLD_CLIP = 1u << 8,      // GL_CLIP_DISTANCE0..5
+    GLD_ALL = 0x1FFu,
+};
+
+typedef struct d3d_sb d3d_sb;
 
 typedef struct {
     u32 type;
@@ -140,8 +163,16 @@ typedef struct d3ddev {
     d3dsurf *backbuffer, *autodepth;
     u32 bb_w, bb_h, bb_fmt, ds_fmt, windowed;
     u32 hwnd;
-    // генерации групп состояния: программа догружает униформы, если её копия устарела
-    u32 gen_xf, gen_light, gen_mat, gen_misc;
+    // таблица гаммы (SetGammaRamp/GetGammaRamp: 3 канала x 256 значений 0..65535)
+    u16 gamma[3][256];
+    int gamma_dirty;
+    // блоки состояний (CreateStateBlock / BeginStateBlock..EndStateBlock)
+    d3d_sb **sb;
+    u32 sb_cap;
+    d3d_sb *rec_sb;
+    // гранулярные поколения групп состояния: программа догружает только изменившиеся униформы
+    u32 gen_xf, gen_view, gen_texm, gen_vp, gen_clip, gen_light, gen_mat, gen_const, gen_psc, gen_bump;
+    u32 gl_dirty;          // битовая маска GLD_* фиксированного состояния GL
     // GL
     GLuint vao, up_vbo, up_ibo, fbo, blit_fbo;
     d3dsurf *fbo_rt, *fbo_ds;  // что сейчас прикреплено к fbo
@@ -164,12 +195,16 @@ void d3d8_present(d3ddev *d);
 void d3d8_caps_probe(d3ddev *d);
 void d3d8_prog_preload(void);  // программы прошлых запусков — в фоновую сборку (d3d8_ff.c)
 int d3d8_dumping(const d3ddev *d);  // кадр SNX_DUMP_DRAWS: печатать состояние отрисовок
-void d3d8_dump_target(d3ddev *d);   // текущая цель рендера -> PNG (отладка)   // возможности GL (анизотропия) — после glGenSamplers
+void d3d8_dump_target(d3ddev *d);   // текущая цель рендера -> PNG (отладка)
 
 // d3d8_ps.c: пиксельные шейдеры ps.1.x
 u32 d3d8_ps_create(const u32 *tokens, u32 max_tokens);  // дескриптор (>0) или 0
 void d3d8_ps_delete(u32 handle);
 const char *d3d8_ps_glsl(u32 handle);  // тело main() фрагментного шейдера (см. d3d8_ps.c)
+u64 d3d8_ps_hash(u32 handle);          // 64-битный хеш байткода (0 — нет)
+const u32 *d3d8_ps_tokens(u32 handle, u32 *out_ntok);  // исходный байткод и число токенов
+// Трансляция байткода ps.1.x в тело GLSL без создания дескриптора (для предзагрузки из SnxPrograms.bin)
+char *d3d8_ps_translate(const u32 *tokens, u32 max_tokens, u32 *out_ntok, u64 *out_hash);
 
 #ifdef __cplusplus
 }

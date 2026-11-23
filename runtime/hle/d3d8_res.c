@@ -148,11 +148,25 @@ d3dtex *d3d8_tex_create(u32 w, u32 h, u32 levels, u32 usage, u32 fmt, u32 pool, 
 }
 
 // ================================================================ поверхности
+void d3d8_fbo_attach(GLenum fb_target, GLenum attachment, const d3dsurf *s)
+{
+    if (!s)
+        glFramebufferRenderbuffer(fb_target, attachment, GL_RENDERBUFFER, 0);
+    else if (s->tex)
+        glFramebufferTexture2D(fb_target, attachment, face_target(s->tex, s->face), s->tex->gl, s->level);
+    else if (s->color_tex)
+        glFramebufferTexture2D(fb_target, attachment, GL_TEXTURE_2D, s->color_tex, 0);
+    else
+        glFramebufferRenderbuffer(fb_target, attachment, GL_RENDERBUFFER, s->rb);
+}
+
 static void surf_destroy(void *p)
 {
     d3dsurf *s = p;
     if (s->rb)
         glDeleteRenderbuffers(1, &s->rb);
+    if (s->color_tex)
+        glDeleteTextures(1, &s->color_tex);
     if (s->movie_tex)
         glDeleteTextures(1, &s->movie_tex);
     if (s->own_mem)
@@ -179,7 +193,24 @@ d3dsurf *d3d8_surf_create(u32 w, u32 h, u32 fmt, u32 usage, u32 pool)
     if (!f)
         return NULL;
     d3dsurf *s = surf_new(w, h, fmt, usage, pool);
-    if (usage & (USAGE_RENDERTARGET | USAGE_DEPTHSTENCIL)) {
+    if ((usage & USAGE_RENDERTARGET) && !f->depth && f->format) {
+        // Цветовые цели рендера и задний буфер — 2D-текстуры (чтобы Present читал их в шейдере без лишнего blit)
+        glGenTextures(1, &s->color_tex);
+        glBindTexture(GL_TEXTURE_2D, s->color_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        if (f->swizzle[0]) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, f->swizzle[0]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, f->swizzle[1]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, f->swizzle[2]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, f->swizzle[3]);
+        }
+        cs_TexImage2D(GL_TEXTURE_2D, 0, (GLint)f->internal, (GLsizei)w, (GLsizei)h, f->format, f->type, NULL, 0);
+    } else if (usage & (USAGE_RENDERTARGET | USAGE_DEPTHSTENCIL)) {
         glGenRenderbuffers(1, &s->rb);
         glBindRenderbuffer(GL_RENDERBUFFER, s->rb);
         glRenderbufferStorage(GL_RENDERBUFFER, f->internal, (GLsizei)w, (GLsizei)h);
@@ -251,17 +282,18 @@ static u32 surf_lock(d3dsurf *s, u32 locked_rect, u32 rect, u32 flags)
         s->lock_rect[2] = s->w;
         s->lock_rect[3] = s->h;
     }
+    int is_rt = s->rb != 0 || s->color_tex != 0;
     if (!s->own_mem) {
-        if (s->rb && !s->rb_mem)
+        if (is_rt && !s->rb_mem)
             s->rb_mem = galloc(size);
-        s->mem = s->rb ? s->rb_mem : galloc(size);
+        s->mem = is_rt ? s->rb_mem : galloc(size);
         s->pitch = pitch;
         if (!s->mem)
             return D3DERR_OUTOFVIDEOMEMORY;
         int keep = !(flags & LOCK_DISCARD);
         if (s->tex && keep && (s->tex->filled & (1u << s->level)))
             read_level(s->tex, s->face, (u32)s->level, g_mem + s->mem);
-        else if (s->rb && keep && !s->movie_mode) {
+        else if (is_rt && keep && !s->movie_mode) {
             // цель рендера: прочитать заблокированный прямоугольник из её FBO (снимок экрана; ReduceMouseLag
             // блокирует 1x1 каждый кадр — ради ожидания GPU). Во время ролика не читаем: заливается только
             // кадр ролика (write_movie), остальное в памяти блокировки не нужно
@@ -269,8 +301,7 @@ static u32 surf_lock(d3dsurf *s, u32 locked_rect, u32 rect, u32 flags)
             GLuint fb;
             glGenFramebuffers(1, &fb);
             glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
-            glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, f->depth ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0,
-                                      GL_RENDERBUFFER, s->rb);
+            d3d8_fbo_attach(GL_READ_FRAMEBUFFER, f->depth ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0, s);
             glPixelStorei(GL_PACK_ALIGNMENT, 1);
             glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)s->w);
             glReadPixels(l, t, (GLsizei)s->lock_rect[2] - l, (GLsizei)s->lock_rect[3] - t, f->format, f->type,
@@ -279,7 +310,7 @@ static u32 surf_lock(d3dsurf *s, u32 locked_rect, u32 rect, u32 flags)
             glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
             glDeleteFramebuffers(1, &fb);
             d3d8_bind_target(d3d8_dev());
-        } else if (!s->rb)
+        } else if (!is_rt)
             memset(g_mem + s->mem, 0, size);
     }
     u32 off = 0;
@@ -323,7 +354,7 @@ static int write_movie(d3dsurf *s, const d3dfmt *f)
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fb[0]);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->movie_tex, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb[1]);
-    glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, s->rb);
+    d3d8_fbo_attach(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, s);
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     float sc = fminf((float)W / (float)mw, (float)H / (float)mh);
@@ -370,7 +401,7 @@ static void write_target(d3dsurf *s, const d3dfmt *f)
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fb[0]);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb[1]);
-    glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, s->rb);
+    d3d8_fbo_attach(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, s);
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glBlitFramebuffer(0, 0, r - l, b - t, l, t, r, b, GL_COLOR_BUFFER_BIT, GL_NEAREST);
@@ -407,7 +438,7 @@ static u32 surf_unlock(d3dsurf *s)
             upload_level(s->tex, s->face, (u32)s->level, g_mem + s->mem);
             if (s->face == 0 && s->level < 32)
                 s->tex->filled |= 1u << s->level;
-        } else if (s->rb) {
+        } else if (s->rb || s->color_tex) {
             const d3dfmt *f = d3d8_format(s->fmt);
             if (f->depth)
                 hle_todo("d3d8: writing into a locked depth buffer is ignored");
@@ -418,6 +449,315 @@ static u32 surf_unlock(d3dsurf *s)
     if (s->mem != s->rb_mem)
         gfree(s->mem);
     s->mem = 0;
+    return D3D_OK;
+}
+
+// ================================================================ CopyRects / UpdateTexture
+static int is_fbo_color_fmt(u32 fmt)
+{
+    switch (fmt) {
+    case FMT_A8R8G8B8: case FMT_X8R8G8B8: case FMT_R5G6B5: case FMT_X1R5G5B5: case FMT_A1R5G5B5:
+    case FMT_A4R4G4B4: case FMT_X4R4G4B4: case FMT_A8: case FMT_L8: case FMT_A8L8:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+// Распаковка/упаковка одного пикселя через 8-битный ARGB для копирования между разными форматами
+static void unpack_argb(u32 fmt, const u8 *p, u8 out[4])
+{
+    u8 a = 255, r = 0, g = 0, b = 0;
+    switch (fmt) {
+    case FMT_A8R8G8B8: b = p[0]; g = p[1]; r = p[2]; a = p[3]; break;
+    case FMT_X8R8G8B8: b = p[0]; g = p[1]; r = p[2]; a = 255; break;
+    case FMT_R8G8B8:   b = p[0]; g = p[1]; r = p[2]; a = 255; break;
+    case FMT_R5G6B5: {
+        u16 v = (u16)(p[0] | (u16)p[1] << 8);
+        r = (u8)(((v >> 11) & 31) * 255 / 31);
+        g = (u8)(((v >> 5) & 63) * 255 / 63);
+        b = (u8)((v & 31) * 255 / 31);
+        break;
+    }
+    case FMT_A1R5G5B5: case FMT_X1R5G5B5: {
+        u16 v = (u16)(p[0] | (u16)p[1] << 8);
+        a = fmt == FMT_A1R5G5B5 ? ((v & 0x8000u) ? 255 : 0) : 255;
+        r = (u8)(((v >> 10) & 31) * 255 / 31);
+        g = (u8)(((v >> 5) & 31) * 255 / 31);
+        b = (u8)((v & 31) * 255 / 31);
+        break;
+    }
+    case FMT_A4R4G4B4: case FMT_X4R4G4B4: {
+        u16 v = (u16)(p[0] | (u16)p[1] << 8);
+        a = fmt == FMT_A4R4G4B4 ? (u8)(((v >> 12) & 15) * 17) : 255;
+        r = (u8)(((v >> 8) & 15) * 17);
+        g = (u8)(((v >> 4) & 15) * 17);
+        b = (u8)((v & 15) * 17);
+        break;
+    }
+    case FMT_A8:   a = p[0]; r = g = b = 0; break;
+    case FMT_L8:   r = g = b = p[0]; a = 255; break;
+    case FMT_A8L8: r = g = b = p[0]; a = p[1]; break;
+    default: break;
+    }
+    out[0] = b; out[1] = g; out[2] = r; out[3] = a;
+}
+
+static void pack_argb(u32 fmt, const u8 in[4], u8 *p)
+{
+    u8 b = in[0], g = in[1], r = in[2], a = in[3];
+    switch (fmt) {
+    case FMT_A8R8G8B8: p[0] = b; p[1] = g; p[2] = r; p[3] = a; break;
+    case FMT_X8R8G8B8: p[0] = b; p[1] = g; p[2] = r; p[3] = 255; break;
+    case FMT_R8G8B8:   p[0] = b; p[1] = g; p[2] = r; break;
+    case FMT_R5G6B5: {
+        u16 v = (u16)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+        p[0] = (u8)v; p[1] = (u8)(v >> 8);
+        break;
+    }
+    case FMT_A1R5G5B5: case FMT_X1R5G5B5: {
+        u16 v = (u16)((((fmt == FMT_A1R5G5B5 ? (a >= 128) : 1) ? 1u : 0u) << 15) |
+                      ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3));
+        p[0] = (u8)v; p[1] = (u8)(v >> 8);
+        break;
+    }
+    case FMT_A4R4G4B4: case FMT_X4R4G4B4: {
+        u16 v = (u16)(((fmt == FMT_A4R4G4B4 ? (a >> 4) : 15u) << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+        p[0] = (u8)v; p[1] = (u8)(v >> 8);
+        break;
+    }
+    case FMT_A8:   p[0] = a; break;
+    case FMT_L8:   p[0] = r; break;
+    case FMT_A8L8: p[0] = r; p[1] = a; break;
+    default: break;
+    }
+}
+
+static void read_surf_cpu(d3dsurf *s, const d3dfmt *f, u8 *buf)
+{
+    if (s->tex) {
+        read_level(s->tex, s->face, (u32)s->level, buf);
+    } else if (s->rb || s->color_tex) {
+        GLuint fb;
+        glGenFramebuffers(1, &fb);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+        d3d8_fbo_attach(GL_READ_FRAMEBUFFER, f->depth ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0, s);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+        glReadPixels(0, 0, (GLsizei)s->w, (GLsizei)s->h, f->format, f->type, buf);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1, &fb);
+        if (d3d8_dev())
+            d3d8_bind_target(d3d8_dev());
+    }
+}
+
+static void write_rt_cpu(d3dsurf *s, const d3dfmt *f, const u8 *buf)
+{
+    GLuint tex, fb[2];
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    cs_TexImage2D(GL_TEXTURE_2D, 0, (GLint)f->internal, (GLsizei)s->w, (GLsizei)s->h, f->format, f->type, buf,
+                  (size_t)d3d8_pitch(f, s->w) * d3d8_rows(f, s->h));
+    glGenFramebuffers(2, fb);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb[0]);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb[1]);
+    d3d8_fbo_attach(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, s);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBlitFramebuffer(0, 0, (GLint)s->w, (GLint)s->h, 0, 0, (GLint)s->w, (GLint)s->h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(2, fb);
+    glDeleteTextures(1, &tex);
+    if (d3d8_dev())
+        d3d8_bind_target(d3d8_dev());
+}
+
+static u32 copy_rects_impl(d3dsurf *src, d3dsurf *dst, u32 src_rects_va, u32 count, u32 dst_pts_va,
+                           const s32 *single_rect)
+{
+    if (!src || !dst)
+        return D3DERR_INVALIDCALL;
+    const d3dfmt *sf = d3d8_format(src->fmt), *df = d3d8_format(dst->fmt);
+    if (!sf || !df || sf->depth || df->depth)
+        return D3DERR_INVALIDCALL;
+    if ((!sf->format || !df->format) && src->fmt != dst->fmt)
+        return D3DERR_INVALIDCALL;
+
+    // Подготовка списка прямоугольников (src_rects_va == 0 -> single_rect или вся поверхность src)
+    s32 full_r[4] = {0, 0, (s32)src->w, (s32)src->h};
+    if (single_rect)
+        memcpy(full_r, single_rect, sizeof full_r);
+    u32 n = src_rects_va ? count : 1u;
+    if (!n)
+        return D3D_OK;
+
+    // Быстрый путь GPU -> GPU для совпадающих цветовых форматов без конвертации
+    int same_alpha_fmt = src->fmt == dst->fmt || (src->fmt == FMT_A8R8G8B8 && dst->fmt == FMT_X8R8G8B8);
+    if (!src->own_mem && !dst->own_mem && sf->format && df->format && same_alpha_fmt &&
+        is_fbo_color_fmt(src->fmt) && is_fbo_color_fmt(dst->fmt)) {
+        GLuint fb[2];
+        glGenFramebuffers(2, fb);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fb[0]);
+        d3d8_fbo_attach(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, src);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb[1]);
+        d3d8_fbo_attach(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, dst);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        for (u32 i = 0; i < n; i++) {
+            s32 l = src_rects_va ? (s32)rd32(g_mem, src_rects_va + 16u * i) : full_r[0];
+            s32 t = src_rects_va ? (s32)rd32(g_mem, src_rects_va + 16u * i + 4u) : full_r[1];
+            s32 r = src_rects_va ? (s32)rd32(g_mem, src_rects_va + 16u * i + 8u) : full_r[2];
+            s32 b = src_rects_va ? (s32)rd32(g_mem, src_rects_va + 16u * i + 12u) : full_r[3];
+            s32 dx = dst_pts_va ? (s32)rd32(g_mem, dst_pts_va + 8u * i) : l;
+            s32 dy = dst_pts_va ? (s32)rd32(g_mem, dst_pts_va + 8u * i + 4u) : t;
+            if (l < 0 || t < 0 || r <= l || b <= t || (s64)r > (s64)src->w || (s64)b > (s64)src->h)
+                continue;
+            s32 w = r - l, h = b - t;
+            if (dx < 0 || dy < 0 || (s64)dx + (s64)w > (s64)dst->w || (s64)dy + (s64)h > (s64)dst->h)
+                continue;
+            glBlitFramebuffer(l, t, r, b, dx, dy, dx + w, dy + h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(2, fb);
+        if (dst->tex && dst->face == 0 && dst->level < 32)
+            dst->tex->filled |= 1u << dst->level;
+        if (d3d8_dev())
+            d3d8_bind_target(d3d8_dev());
+        return D3D_OK;
+    }
+
+    // Общий путь через CPU (CPU<->CPU, CPU<->GPU, сжатые форматы DXT, конвертация форматов, GetFrontBuffer)
+    u32 spitch = src->own_mem ? src->pitch : d3d8_pitch(sf, src->w);
+    u32 srows = d3d8_rows(sf, src->h);
+    u8 *sown = NULL;
+    const u8 *sbuf;
+    if (src->own_mem)
+        sbuf = g_mem + src->mem;
+    else {
+        sown = calloc(1, (size_t)spitch * srows);
+        if (!sown)
+            return D3DERR_OUTOFVIDEOMEMORY;
+        read_surf_cpu(src, sf, sown);
+        sbuf = sown;
+    }
+
+    u32 dpitch = dst->own_mem ? dst->pitch : d3d8_pitch(df, dst->w);
+    u32 drows = d3d8_rows(df, dst->h);
+    int full_replace = !src_rects_va && !dst_pts_va && full_r[0] == 0 && full_r[1] == 0 &&
+                       full_r[2] == (s32)dst->w && full_r[3] == (s32)dst->h;
+    u8 *down = NULL, *dbuf;
+    if (dst->own_mem)
+        dbuf = g_mem + dst->mem;
+    else {
+        down = calloc(1, (size_t)dpitch * drows);
+        if (!down) {
+            free(sown);
+            return D3DERR_OUTOFVIDEOMEMORY;
+        }
+        if (!full_replace && (!dst->tex || (dst->tex->filled & (1u << dst->level))))
+            read_surf_cpu(dst, df, down);
+        dbuf = down;
+    }
+
+    for (u32 i = 0; i < n; i++) {
+        s32 l = src_rects_va ? (s32)rd32(g_mem, src_rects_va + 16u * i) : full_r[0];
+        s32 t = src_rects_va ? (s32)rd32(g_mem, src_rects_va + 16u * i + 4u) : full_r[1];
+        s32 r = src_rects_va ? (s32)rd32(g_mem, src_rects_va + 16u * i + 8u) : full_r[2];
+        s32 b = src_rects_va ? (s32)rd32(g_mem, src_rects_va + 16u * i + 12u) : full_r[3];
+        s32 dx = dst_pts_va ? (s32)rd32(g_mem, dst_pts_va + 8u * i) : l;
+        s32 dy = dst_pts_va ? (s32)rd32(g_mem, dst_pts_va + 8u * i + 4u) : t;
+        if (l < 0 || t < 0 || r <= l || b <= t || (s64)r > (s64)src->w || (s64)b > (s64)src->h)
+            continue;
+        s32 w = r - l, h = b - t;
+        if (dx < 0 || dy < 0 || (s64)dx + (s64)w > (s64)dst->w || (s64)dy + (s64)h > (s64)dst->h)
+            continue;
+        if (!sf->format) {
+            // Сжатый формат (блоки 4x4)
+            u32 bx0 = (u32)l / 4u, by0 = (u32)t / 4u, dbx0 = (u32)dx / 4u, dby0 = (u32)dy / 4u;
+            u32 bw = ((u32)w + 3u) / 4u, bh = ((u32)h + 3u) / 4u;
+            for (u32 y = 0; y < bh; y++)
+                memcpy(dbuf + (size_t)(dby0 + y) * dpitch + (size_t)dbx0 * df->bpp,
+                       sbuf + (size_t)(by0 + y) * spitch + (size_t)bx0 * sf->bpp, (size_t)bw * sf->bpp);
+        } else if (src->fmt == dst->fmt) {
+            size_t row_bytes = (size_t)w * sf->bpp;
+            for (s32 y = 0; y < h; y++)
+                memcpy(dbuf + (size_t)(dy + y) * dpitch + (size_t)dx * df->bpp,
+                       sbuf + (size_t)(t + y) * spitch + (size_t)l * sf->bpp, row_bytes);
+        } else {
+            for (s32 y = 0; y < h; y++) {
+                const u8 *sr = sbuf + (size_t)(t + y) * spitch + (size_t)l * sf->bpp;
+                u8 *dr = dbuf + (size_t)(dy + y) * dpitch + (size_t)dx * df->bpp;
+                for (s32 x = 0; x < w; x++) {
+                    u8 px[4];
+                    unpack_argb(src->fmt, sr + (size_t)x * sf->bpp, px);
+                    pack_argb(dst->fmt, px, dr + (size_t)x * df->bpp);
+                }
+            }
+        }
+    }
+
+    if (!dst->own_mem) {
+        if (dst->tex) {
+            upload_level(dst->tex, dst->face, (u32)dst->level, down);
+            if (dst->face == 0 && dst->level < 32)
+                dst->tex->filled |= 1u << dst->level;
+        } else if (dst->rb || dst->color_tex) {
+            write_rt_cpu(dst, df, down);
+        }
+    }
+    free(sown);
+    free(down);
+    return D3D_OK;
+}
+
+u32 d3d8_copy_rects(d3dsurf *src, d3dsurf *dst, u32 src_rects_va, u32 count, u32 dst_pts_va)
+{
+    return copy_rects_impl(src, dst, src_rects_va, count, dst_pts_va, NULL);
+}
+
+u32 d3d8_copy_surface(d3dsurf *src, d3dsurf *dst)
+{
+    if (!src || !dst)
+        return D3DERR_INVALIDCALL;
+    u32 w = src->w < dst->w ? src->w : dst->w;
+    u32 h = src->h < dst->h ? src->h : dst->h;
+    if (!w || !h)
+        return D3D_OK;
+    s32 r[4] = {0, 0, (s32)w, (s32)h};
+    return copy_rects_impl(src, dst, 0, 0, 0, r);
+}
+
+u32 d3d8_update_texture(d3dtex *src, d3dtex *dst)
+{
+    if (!src || !dst || src->cube != dst->cube || src->fmt != dst->fmt)
+        return D3DERR_INVALIDCALL;
+    // По спецификации D3D8: если у src больше мип-уровней, начинаем с уровня, совпадающего по размеру с dst
+    u32 src_base = src->levels;
+    for (u32 l = 0; l < src->levels; l++) {
+        if (mip(src->w, l) == dst->w && mip(src->h, l) == dst->h) {
+            src_base = l;
+            break;
+        }
+    }
+    if (src_base >= src->levels)
+        return D3DERR_INVALIDCALL;
+    u32 levels = dst->levels;
+    if (src_base + levels > src->levels)
+        levels = src->levels - src_base;
+    int faces = src->cube ? 6 : 1;
+    for (int f = 0; f < faces; f++) {
+        for (u32 l = 0; l < levels; l++) {
+            d3dsurf *ss = tex_surface(src, f, src_base + l);
+            d3dsurf *ds = tex_surface(dst, f, l);
+            u32 hr = d3d8_copy_rects(ss, ds, 0, 0, 0);
+            if (hr != D3D_OK)
+                return hr;
+        }
+    }
     return D3D_OK;
 }
 

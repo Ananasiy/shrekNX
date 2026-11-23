@@ -2,7 +2,77 @@
 
 Формат — по версиям, новые сверху. Замеры производительности относятся к указанной сборке и сцене.
 
-## Не выпущено
+## 0.2.0 — 2026-11-23
+
+Консольный интерфейс и вибрация, рендер D3D8 с пост-проходом и кешем программ, тесты рантайма. Проверено в
+портативе Switch (1280×720, полный режим памяти): меню 60 FPS, ролики 50–60 FPS, болото 43–60 FPS; легенда
+кнопок, скрытие настроек ПК после загрузки уровня, вибрация при уроне и ударах, подсказка в applet-режиме.
+Готовые игровые NRO по-прежнему не распространяются.
+
+### Добавлено
+
+- **Консольный интерфейс и Quick Menu** (`runtime/hle/overlay.c`, `runtime/game/menu.c`, `host/boot/input.c`):
+  - кириллица (`U+0400..U+045F`, включая `Ё/ё`) и безопасный разбор UTF-8 в атласе `overlay.c`;
+  - контекстная легенда кнопок Switch внизу справа страниц меню (EN/RU), без подложки — значки и текст с тенью,
+    как в системном интерфейсе (серая плашка выделялась на чёрных полосах, особенно на OLED);
+  - значки кнопок Switch на вкладке `GAME` (`Tab_OptionsGame`) и центрирование оставшихся элементов на вкладке
+    `VIDEO` (`Tab_OptionsVideo`);
+  - Quick Menu поверх игры и меню по `ZL+Plus` (`[Pad] ZL+Plus=QuickMenu` в `Snx.ini`): переключение
+    `ShowFPS`, `MenuAspect4x3`, `InvertCameraY`, `CameraSpeed`, `MoveSpeed`, `DeadZone` и `Rumble` на лету
+    с атомарным сохранением в `Snx.ini`;
+  - поддержка экранной клавиатуры Switch (`swkbdShow`) при фокусе на `GUIEditBox` (`[проверить]` на консоли) и
+    декодирование UTF-8 → UTF-16 BMP для `SDL_TEXTINPUT` на ПК;
+  - вибрация (`[Pad] Rumble=True`, `hle_rumble_hook`; Switch — hid libnx, ПК — `SDL_GameControllerRumble`): импульс при
+    уроне игроку и при гибели по здоровью пешки, при попадании героя по врагам и предметам по флагам
+    `bWasHitInThisAttack` целей (`runtime/game/rumble.c`; на ПК у игры отдачи нет — раньше
+    вибрация срабатывала только пробным импульсом в Quick Menu), в логе — геймпады и первые импульсы.
+- **Рендер D3D8 → OpenGL** (`runtime/hle/d3d8*.c`):
+  - пост-проход `Present` с гамма-коррекцией (`SetGammaRamp`/`GetGammaRamp`, LUT 256×1 `GL_RGB16`) и опциональным
+    режимом 4:3-pillarbox для страниц меню на широком экране (`[Overlay] MenuAspect4x3=False` по умолчанию; при
+    включении согласуются 3D-проекция камеры книги, координаты ввода и неискажённый оверлей в окне);
+  - сохранение и фоновая предзагрузка пиксельных шейдеров `ps.1.x` в `SnxPrograms.bin` v2, динамический кеш
+    программ (до 65536 с LRU-вытеснением) и опциональный кеш бинарников программ GL `SnxProgramBins.bin`
+    (`glGetProgramBinary`/`glProgramBinary`, `[проверить]` на Switch/Mesa);
+  - реализованы методы `CopyRects`, `UpdateTexture`, `GetFrontBuffer` и `StateBlocks` (`Begin`/`End`/`Apply`/
+    `Capture`/`Delete`/`CreateStateBlock`).
+- **Системный слой и Win32 HLE** (`platform/`, `host/boot/main.c`, `runtime/rt.c`, `runtime/hle/`):
+  - хуки жизненного цикла Switch (`appletHook`: `OnFocusState`, `OnResume`, `OnOperationMode`, `OnExitRequest`)
+    и обработка фокуса окна на ПК (`SDL_WINDOWEVENT_FOCUS_LOST`/`GAINED`): `WM_ACTIVATEAPP`, паузируемые
+    монотонные часы гостя (`rt_guest_ticks_ns`, ограничение скачка после сна 500 мс) и пауза OpenAL
+    (`openal_pause`, `[проверить]` на Switch);
+  - подсказка при нехватке памяти в applet-режиме Switch — текстовой консолью libnx до запуска SDL
+    (`rt_platform_preflight`, вывод прямо в устройство консоли — stdout уже перенаправлен в nxlink или лог); прежний
+    `errorApplicationShow` в этом месте ронял Atmosphère;
+  - корректный дренаж и остановка потока рендера (`cs_stop()`) и OpenAL (`openal_shutdown()`) при выходе;
+  - реальное локальное время (`localtime_r`) в `GetLocalTime` и полная реализация `GetDateFormatA`/`GetTimeFormatA`;
+  - атомарная запись конфигов (`config.c`, `input.c`) и реестра (`advapi32.c`) через `.tmp` + `rename()`.
+- **Инфраструктура, рекомпилятор и тестирование:**
+  - поддержка сборки на Linux (`CMakeLists.txt`, `platform/gl.h`, `runtime/vmem.c`, `runtime/rt.c`, CI-задача
+    `linux-arm64` с `-DSNX_PIN=ON`, `[проверить]` на реальном Linux);
+  - поиск зависимостей macOS без жёсткой привязки к `/opt/homebrew` и опция `-DSNX_SANITIZE=address;undefined`;
+  - команда `recomp/main.py check --game <dir>` (проверка 12 модулей, выявление зашифрованного SafeDisc
+    `Game.exe`, проверка всех 56 записей `overrides.py` и соседних каталогов ассетов);
+  - параллельный запуск `recomp/main.py discover`/`gen` (`-j`/`--jobs`, побайтово детерминированный вывод) и
+    экспериментальный флаг `SNX_FPU_SINGLE=1` (округление арифметики x87 к `float`);
+  - 6 новых синтетических CTest-тестов (`vmem_test`, `heap_test`, `d3d8_ps_test`, `bink_test`, `config_test`,
+    `camera_aspect_test` — всего 11 тестов в CTest) и 20 юнит-тестов рекомпилятора (`tests/test_recomp.py`);
+  - скрипты `tools/test_maps.py` (автоматический прогон карт с проверкой `TRAP`/`TODO`/`GL error`/`ABI` и
+    сравнением PNG по MSE/PSNR) и `tools/probe/crash.py` (разбор логов падений Switch).
+
+### Ускорено
+
+- **Куча, Bink, рендер и чтение архивов:**
+  - slab-аллокатор 64 КБ в `runtime/heap.c` с возвратом пустых слабов в `vm_free`;
+  - потоковое чтение файловых `.bik` в `runtime/hle/bink.c` (без загрузки целого ролика в ОЗУ) и NEON-конверсия
+    YUV → RGB на ARM64 (`bink_video.c`, до 3,4× быстрее на macOS arm64);
+  - гранулярные флаги состояния (`gl_dirty`, `gen_*`) и расчёт нормальной матрицы на CPU в `d3d8_ff.c`;
+  - оптимизирован `overlay.c` (5 `glGetIntegerv` вместо 22, освобождение буфера атласа после заливки, статический
+    батч без `malloc` на кадр);
+  - нативный быстрый путь `FArchiveFileReader::Serialize` (`game.exe!0x10908610`, `ovr_launch_file_read`,
+    сверка `SNX_AR_CHECK=1`).
+- **Открытие файлов на Switch:** существование и тип файла берутся из кеша листингов каталогов, размер — одним
+  запросом `GetSize`. Раньше каждое открытие существующего файла делало `stat` (пять-шесть запросов к сервисам,
+  включая перевод метки времени), а `GetFileSize` — `fstat`.
 
 ### Исправлено
 
@@ -13,12 +83,22 @@
   списка, кеш ini читается без вызовов кода игры, размер только что записанного файла известен без открытия, а
   запись `User.ini` идёт в фоновом потоке. Switch, подборы с паузой 150 мс: 3,7–4,4 мс на монету (с одним пропуском
   перечитывания было 10–17 мс, кадр пропускался на каждой монете). macOS: 2,0 → 0,5 мс.
-
-### Ускорено
-
-- **Открытие файлов на Switch:** существование и тип файла берутся из кеша листингов каталогов, размер — одним
-  запросом `GetSize`. Раньше каждое открытие существующего файла делало `stat` (пять-шесть запросов к сервисам,
-  включая перевод метки времени), а `GetFileSize` — `fstat`.
+- **Безопасность парсеров и границ:** проверка усечённых токенов и комментариев в `d3d8_ps.c`, защита от
+  переполнений и повреждённых пакетов в `bink.c`/`bink_audio.c`, `d3d8_res.c` (`CopyRects`), `d3d8_dev.c`
+  (`SetGammaRamp`/`GetGammaRamp`) и `vmem.c`, а также чтение реестра (`advapi32.c`) без сброса кеша VFS.
+- **Меню настроек после смены карты и режим 4:3 на Switch** (`runtime/game/menu.c`, `runtime/hle/overlay.c`,
+  `runtime/hle/d3d8_ff.c`, `runtime/overrides_engine.c`, `runtime/overrides_core.c`):
+  - сброс кеша классов меню (`g_cls[]`) при каждой `UObject::CollectGarbage` (`rt_gc_epoch`), определение
+    `Tab_OptionsGame`/`Tab_OptionsVideo` (включая `Tab_InGameOptionsVideo`) прямо в кеше без задержки и без
+    устаревающих указателей — скрытые настройки (`Resolution`/`ColorDepth`/`Renderer`/`btnApplyVideoChanges`) и
+    раскладка геймпада больше не слетают после перехода в новую игру;
+  - `btnApplyVideoChanges` убрана вместе с правой колонкой `Tab_OptionsVideo`, чтобы случайное нажатие Apply не
+    сбрасывало разрешение на `640×480`;
+  - оверлей порта (значки Switch, легенда меню, Quick Menu) перенесён в пост-проход `Present` прямо в окно
+    (`FBO 0`, квадратные пиксели 1:1 без сжатия и без влияния гаммы игры);
+  - `MenuAspect4x3` выключен по умолчанию (у страниц книги игры уже есть кинематографические полосы 12,5 % сверху
+    и снизу), а при включении в Quick Menu `FCameraSceneNode::UpdateMatrices` переключается с Hor+ на честную
+    4:3-проекцию без сплющивания 3D-книги и пустой области справа.
 
 ## 0.1.0 — 2026-11-18
 

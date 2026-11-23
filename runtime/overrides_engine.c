@@ -15,6 +15,10 @@ extern void (*const ovr_orig_ovr_engine_camera_matrices)(CPU *c);
 
 #define NODE_FOV 0x1E0u
 #define PROJ 0x94u
+#define SCREEN_TO_CAM 0xD4u
+#define WORLD_TO_SCREEN 0x114u
+#define SCREEN_TO_WORLD 0x154u
+#define NODE_DET 0x1B8u
 
 void ovr_engine_camera_matrices(CPU *c)
 {
@@ -28,6 +32,24 @@ void ovr_engine_camera_matrices(CPU *c)
     float fov = rdf32(g_mem, node + NODE_FOV);
     if (k < 1.01 || !(fov > 1.0f && fov < 170.0f))
         return;
+    // В режиме 4:3 для страниц меню (MenuAspect4x3) задний буфер 16:9 при Present сжимается по ширине до 4:3:
+    // вместо Hor+ приводим вертикальный масштаб проекции к 4:3 (P' = P * diag(1, 1/k, 1, 1)), чтобы 3D-книга
+    // сохранила исходные пропорции и границы без пустой области справа и без сжатия по горизонтали.
+    if (__atomic_load_n(&rt_menu_aspect_4x3, __ATOMIC_RELAXED)) {
+        float inv_k = (float)(1.0 / k), fk = (float)k;
+        wrf32(g_mem, node + PROJ + 0x14u, m11 * inv_k);
+        wrf32(g_mem, node + SCREEN_TO_CAM + 0x14u, rdf32(g_mem, node + SCREEN_TO_CAM + 0x14u) * fk);
+        for (u32 r = 0; r < 4; r++) {
+            u32 off = node + WORLD_TO_SCREEN + (r * 4u + 1u) * 4u;
+            wrf32(g_mem, off, rdf32(g_mem, off) * inv_k);
+        }
+        for (u32 col = 0; col < 4; col++) {
+            u32 off = node + SCREEN_TO_WORLD + (4u + col) * 4u;
+            wrf32(g_mem, off, rdf32(g_mem, off) * fk);
+        }
+        wrf32(g_mem, node + NODE_DET, rdf32(g_mem, node + NODE_DET) * inv_k);
+        return;
+    }
     double wide = 2.0 * atan(tan((double)fov * M_PI / 360.0) * k) * 180.0 / M_PI;
     wrf32(g_mem, node + NODE_FOV, (float)wide);
     c->esp -= 4;  // повторный вызов тем же адресом возврата (thiscall без аргументов)
@@ -36,6 +58,15 @@ void ovr_engine_camera_matrices(CPU *c)
     RT_ENTER_GEN(c, ovr_orig_ovr_engine_camera_matrices);  // оригинал — код гостя
     wrf32(g_mem, node + NODE_FOV, fov);
 }
+
+// Примечание по пропорциям 2D HUD на 16:9:
+// UCanvas::Update (Engine.dll!0x120f95e0) переносит Viewport->SizeX/SizeY в Canvas->ClipX/ClipY (+0x40/+0x44)
+// и SizeX/SizeY (+0x64/+0x68). Скрипты HUD (SHHud, HudItemHealthBar.RenderHud, HudItemCoins в SHGame.u)
+// вычисляют X/ширину отдельно от Canvas.SizeX, а Y/высоту — от Canvas.SizeY, рисуя через общий UCanvas::DrawTile
+// (Engine.dll!0x120f88a0), который также используется меню GUI, шрифтами, затемнениями экрана и экранами загрузки.
+// Подмена координат в UCanvas::DrawTile без контекста виджета нарушит выравнивание текста, клик-области GUI и
+// полноэкранные затемнения, поэтому страницы меню исправляются 4:3-pillarbox в d3d8_present (d3d8_set_menu_aspect),
+// а адаптация внутриигрового HUD требует скоординированного перехвата в recomp/overrides.py + проверки в игре.
 
 // ---------------------------------------------------------------- без сброса рендера после сохранения
 // UGameEngine::Tick после отложенного сохранения (автосохранение, точки сохранения) зовёт SaveGame, затем

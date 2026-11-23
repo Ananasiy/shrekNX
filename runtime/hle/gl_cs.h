@@ -19,6 +19,7 @@ int cs_enabled(void);                                         // поток ре
 int cs_on_render_thread(void);                                // вызов из потока рендера (для профайлера)
 extern void (*cs_render_thread_hook)(void);                   // зовётся в начале потока рендера (профайлер)
 int cs_start(int core);                                       // запустить поток рендера на ядре core; 0 — успех
+void cs_stop(void);                                           // дренировать очередь и корректно остановить поток рендера
 void cs_sync(void (*fn)(void *arg), void *arg);               // fn(arg) в потоке рендера, дождаться
 void cs_async(void (*fn)(void *arg), const void *arg, size_t size);  // fn(копия arg) в потоке рендера
 void cs_finish(void);                                         // дождаться пустой очереди

@@ -129,13 +129,12 @@ store:
 extern void (*const ovr_orig_ovr_core_collect_garbage)(CPU *c);
 extern void (*const ovr_orig_ovr_core_struct_link)(CPU *c);
 
-static u32 g_gc_epoch = 1;  // сборки мусора: классы могли освободиться (перечитывание конфига ниже)
-
 void ovr_core_collect_garbage(CPU *c)
 {
-    g_gc_epoch++;
+    __atomic_add_fetch(&rt_gc_epoch, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&g_fn_epoch, 1, __ATOMIC_RELAXED);
     RT_ENTER_GEN(c, ovr_orig_ovr_core_collect_garbage);  // оригинал — код гостя
+    __atomic_add_fetch(&rt_gc_epoch, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&g_fn_epoch, 1, __ATOMIC_RELAXED);
 }
 
@@ -340,9 +339,10 @@ void ovr_core_load_config(CPU *c)
         memset(g_sc.cls, 0, sizeof g_sc.cls);
         slot = (cls * 0x9E3779B1u) >> 20;
     }
-    int same = g_sc.cls[slot].cls == cls && g_sc.cls[slot].epoch == g_gc_epoch && g_sc.cls[slot].hash == h;
+    u32 gc_ep = __atomic_load_n(&rt_gc_epoch, __ATOMIC_RELAXED);
+    int same = g_sc.cls[slot].cls == cls && g_sc.cls[slot].epoch == gc_ep && g_sc.cls[slot].hash == h;
     g_sc.cls[slot].cls = cls;
-    g_sc.cls[slot].epoch = g_gc_epoch;
+    g_sc.cls[slot].epoch = gc_ep;
     g_sc.cls[slot].hash = h;
     if (same && !cfg_check()) {
         g_sc.skipped++;
