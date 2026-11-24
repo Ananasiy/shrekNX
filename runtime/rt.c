@@ -192,11 +192,12 @@ void rt_invoke(CPU *c, guest_fn fn, int native)
 
 #ifdef SNX_PIN
 // Трамплин рантайм -> код гостя с закреплёнными регистрами (runtime/abi.h). Регистры как в runtime/gen_rt.h: eax x19,
-// ecx x20, edx x21, ebx x22, esp x23, ebp x24, esi x25, edi x26, m (g_mem) x27; в CPU eax..edi — смещения 0..28.
-// x19–x28 у хоста сохраняемые: свои значения рантайма — в кадре трамплина, x28 — c на время вызова.
+// ecx x20, edx x21, ebx x22, esp x23, ebp x24, esi x25, edi x26, m (g_mem) x27, CPU *c (g_pin_c) x28; в CPU
+// eax..edi — смещения 0..28. x19–x28 у хоста сохраняемые: свои значения рантайма — в кадре трамплина.
 _Static_assert(offsetof(CPU, eax) == 0 && offsetof(CPU, esp) == 16 && offsetof(CPU, edi) == 28, "CPU layout");
-__asm__(".text\n"
+__asm__(".section .text.rt_pin_enter,\"ax\",%progbits\n"
         ".global rt_pin_enter\n"
+        ".hidden rt_pin_enter\n"
         ".type rt_pin_enter, %function\n"
         ".p2align 2\n"
         "rt_pin_enter:\n"
@@ -226,7 +227,8 @@ __asm__(".text\n"
         "    ldp x27, x28, [sp, #80]\n"
         "    ldp x29, x30, [sp], #96\n"
         "    ret\n"
-        ".size rt_pin_enter, .-rt_pin_enter\n");
+        ".size rt_pin_enter, .-rt_pin_enter\n"
+        ".previous\n");
 #endif
 
 int rt_check_abi;
@@ -400,10 +402,14 @@ void rt_call(CPU *c, u32 target)
     check_abi(c, target, ret, saved);
 }
 
-void rt_ic_base(CPU *c) { rt_trap(c, 0, "call to unknown guest address"); }
+#ifndef SNX_PIN
+__attribute__((cold)) void rt_ic_base(CPU *c) { rt_trap(c, 0, "call to unknown guest address"); }
+#endif
 
 // промахи мест вызова (abi.h): без общего кеша каждый раз шли бы в хеш-таблицу всех функций
-u64 rt_ic2[RT_IC2_SIZE];
+_Alignas(64) u64 rt_ic2[RT_IC2_SIZE];
+// теневая таблица прямого отображения для диспетчера UnrealScript GNatives (4096 слотов)
+_Alignas(64) u64 rt_gnatives_cache[RT_GNATIVE_SIZE];
 
 void rt_call_ic(CPU *c, u32 target, u64 *ic)
 {
@@ -412,20 +418,30 @@ void rt_call_ic(CPU *c, u32 target, u64 *ic)
     if ((u32)v != target || !target) {
         int native = 0;
         guest_fn fn = rt_check_abi ? NULL : rt_lookup_k(target, &native);  // с проверкой ABI — всегда через rt_call
-        intptr_t off = fn ? (intptr_t)(uintptr_t)fn - (intptr_t)(uintptr_t)rt_ic_base : 0;
-        if (!fn || off != (s32)off) {
+        if (!fn) {
             rt_call(c, target);
             return;
         }
 #ifdef SNX_PIN
-        off |= native;  // бит 0 (функции выровнены): функция хоста — место вызова обернёт её SPILL/RELOAD (gen_rt.h)
+        // Нативная функция хоста (COM/HLE/оверрайд) кешируется через pinned-ABI обёртку (runtime/icall_pin.c):
+        // место вызова зовёт её напрямую без бита native и без ухода в rt_icall_slow.
+        guest_fn cached = native ? rt_pin_wrap_native(fn) : fn;
+#else
+        guest_fn cached = fn;
 #endif
+        intptr_t off = cached ? (intptr_t)(uintptr_t)cached - (intptr_t)(uintptr_t)rt_ic_base : 0;
+        if (!cached || off != (s32)off) {
+            rt_call(c, target);
+            return;
+        }
         v = (u64)(u32)(s32)off << 32 | target;
-        __atomic_store_n(e, v, __ATOMIC_RELAXED);
+        __atomic_store_n(e, v, __ATOMIC_RELEASE);
+        __atomic_store_n(ic, v, __ATOMIC_RELEASE);
+        rt_invoke(c, fn, native);
+        return;
     }
     __atomic_store_n(ic, v, __ATOMIC_RELAXED);
-    s32 off = (s32)(u32)(v >> 32);
-    rt_invoke(c, (guest_fn)((uintptr_t)rt_ic_base + (uintptr_t)(intptr_t)(off & ~1)), off & 1);
+    rt_invoke(c, (guest_fn)((uintptr_t)rt_ic_base + (intptr_t)((s64)v >> 32)), 0);
 }
 
 // ---------------------------------------------------------------- ошибки

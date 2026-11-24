@@ -8,6 +8,7 @@
 // внутри них вызовы GL идут напрямую.
 #pragma once
 #include <stddef.h>
+#include <stdint.h>
 
 #include "platform/gl.h"
 
@@ -22,6 +23,18 @@ int cs_start(int core);                                       // запусти�
 void cs_stop(void);                                           // дренировать очередь и корректно остановить поток рендера
 void cs_sync(void (*fn)(void *arg), void *arg);               // fn(arg) в потоке рендера, дождаться
 void cs_async(void (*fn)(void *arg), const void *arg, size_t size);  // fn(копия arg) в потоке рендера
+typedef void (*cs_cmd_fn)(void *payload);
+// Компактная команда верхнего уровня (D3D8): заголовок 16 байт, payload выровнен на 16 байт.
+// В однопоточном режиме вызывает fn(payload) сразу без копирования.
+void cs_cmd_push(cs_cmd_fn fn, const void *payload, size_t payload_size);
+// Команда с переменным хвостом данных (копируется в кольцо или в кучу при > BIG_DATA);
+// в payload по смещениям ptr_field_off и heap_field_off записываются указатели на данные и блок malloc.
+// В однопоточном режиме fn получает исходный hdr (вызывающий заранее ставит ptr = data, heap = NULL).
+void cs_cmd_push_var(cs_cmd_fn fn, const void *hdr, size_t hdr_size, const void *data, size_t data_size,
+                     size_t ptr_field_off, size_t heap_field_off);
+// Позиция записи (Core 1) и исполненный хвост (Core 2 -> Core 1 acquire) для трекинга слотов динамических буферов.
+uint64_t cs_wr_pos(void);
+uint64_t cs_tail_pos(void);
 void cs_finish(void);                                         // дождаться пустой очереди
 void cs_swap(void);                                           // показать кадр (plat_swap) и ограничить отставание
 // Накопленное с прошлого вызова: записей и байт в очереди, ожиданий cs_sync, время ожидания потоком гостя,
@@ -148,7 +161,7 @@ void cs_glDeleteBuffers(GLsizei n, const GLuint *names);
 void cs_glDeleteFramebuffers(GLsizei n, const GLuint *names);
 void cs_glDeleteRenderbuffers(GLsizei n, const GLuint *names);
 
-#ifndef GL_CS_IMPL
+#if !defined(GL_CS_IMPL) && !defined(GL_CS_NO_WRAP)
 // clang-format off
 #undef glActiveTexture
 #define glActiveTexture cs_glActiveTexture

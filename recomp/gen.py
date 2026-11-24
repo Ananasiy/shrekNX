@@ -65,6 +65,10 @@ class Ctx:
         self.mod_of = {}
         for img in prog.images.values():
             self.mod_of[img.name.lower()] = img
+        # Базовый адрес таблицы диспетчера UnrealScript GNatives (4096 слотов): разный в EN и RUS Core.dll
+        core_img = self.mod_of.get("core.dll")
+        self.gnatives_base = (core_img.exports.get("?GNatives@@3PAP8UObject@@AEXAAUFFrame@@QAX@ZA")
+                              if core_img is not None else None)
 
     def fname(self, addr):
         return f"f_{addr:08x}"
@@ -104,7 +108,7 @@ class Ctx:
             return CallInfo(sym, rd)
         name = self.prog.export_name_at(t)
         if name in SETJMP_EXPORTS and mod is not None and t in mod.functions:
-            return CallInfo(self.fname(t), 0, setjmp=True)
+            return CallInfo(self.fname(t), 0, setjmp=True, addr=t)
         if name in X87_INTRINSICS:
             return CallInfo(None, None, intrinsic=name)
         if mod is not None:
@@ -167,11 +171,11 @@ class Ctx:
             return None
         fc = FuncCompiler(mod, f, self)
         code = fc.compile()
-        head = f"void {self.fname(t)}(CPU *restrict c)\n"
+        head = f"void {self.fname(t)}(SNX_C_PARAM)\n"
         if (fc.errors or fc.x87_bad or fc.setjmps or not code.startswith(head)
-                or re.search(r"\b(?:f|fc|fi|hle|ovr)_\w+\(c\)|RT_ICALL|rt_call\(", code)):
+                or re.search(r"\b(?:f|fc|fi|hle|ovr)_\w+\((?:c|SNX_C_ARG)\)|RT_ICALL|RT_GNATIVE_CALL|rt_call\(", code)):
             return None
-        self._inline[t] = f"{INLINE_DECL} fi_{t:08x}(CPU *restrict c)\n" + code[len(head):]
+        self._inline[t] = f"{INLINE_DECL} fi_{t:08x}(SNX_C_PARAM)\n" + code[len(head):]
         return self._inline[t]
 
     def signature_at(self, mod, t):
@@ -258,8 +262,8 @@ def _compile_chunk(ctx, mod, chunk, stem, chunk_num, mdir):
         if intr:
             # x87-интринсик (_CI*, _ftol*, вложенный _ftol2): все вызовы исполняют его нативно,
             # тело берёт аргумент из ST(0) вызывающего — как отдельная функция непредставимо
-            bodies.append(f"void {ctx.fname(e)}(CPU *c)\n{{\n    rt_trap(c, {e:#x}u, \"x87 intrinsic {intr} "
-                          f"called indirectly\");\n}}")
+            bodies.append(f"void {ctx.fname(e)}(SNX_C_PARAM)\n{{\n    P_(CPU *restrict c = g_pin_c;)\n"
+                          f"    rt_trap(c, {e:#x}u, \"x87 intrinsic {intr} called indirectly\");\n}}")
             continue
         fc = FuncCompiler(mod, mod.functions[e], ctx)
         code = fc.compile()
@@ -272,11 +276,12 @@ def _compile_chunk(ctx, mod, chunk, stem, chunk_num, mdir):
             unimpl[m] = unimpl.get(m, 0) + 1
         bodies.append(code)
     text = "\n\n".join(bodies)
-    syms = sorted(set(re.findall(r"\b((?:f|fc|hle|ovr)_[A-Za-z0-9_]+)\(c\)", text)))
-    protos = "\n".join(f"void {s}(CPU *c);" for s in syms)
-    inl = sorted({int(x, 16) for x in re.findall(r"\bfi_([0-9a-f]{8})\(c\)", text)})
+    guest_syms = sorted(set(re.findall(r"\b((?:f|fc)_[0-9a-f]{8})\(SNX_C_ARG\)", text)))
+    host_syms = sorted(set(re.findall(r"\b((?:hle|ovr)_[A-Za-z0-9_]+)\(c\)", text)))
+    protos = "\n".join([f"void {s}(SNX_C_PARAM);" for s in guest_syms] + [f"void {s}(CPU *c);" for s in host_syms])
+    inl = sorted({int(x, 16) for x in re.findall(r"\bfi_([0-9a-f]{8})\(SNX_C_ARG\)", text)})
     if inl:
-        protos += "\n" + "\n".join(f"{INLINE_DECL} fi_{t:08x}(CPU *restrict c);" for t in inl)
+        protos += ("\n" if protos else "") + "\n".join(f"{INLINE_DECL} fi_{t:08x}(SNX_C_PARAM);" for t in inl)
         text += "\n\n" + "\n\n".join(ctx.inline_body(t) for t in inl)
     fn = f"{stem}_{chunk_num:04d}.c"
     write_if_changed(os.path.join(mdir, fn), f"/* Сгенерировано recomp из {name}. Не редактировать, не коммитить. */\n"
@@ -313,7 +318,7 @@ def _write_module_tail(ctx, mod, stem, mdir, funcs, chunk_results, log=print):
     crc, size = module_crc(mod.img.path)
     lines = [f"/* Сгенерировано recomp из {name}. */", '#include "runtime/gen_rt.h"', '#include "runtime/loader.h"', ""]
     for e in funcs:
-        lines.append(f"void {ctx.fname(e)}(CPU *c);")
+        lines.append(f"void {ctx.fname(e)}(SNX_C_PARAM);")
     iat = []
     for imp in mod.img.imports:
         r = ctx.prog.resolve_import(imp)
@@ -328,7 +333,7 @@ def _write_module_tail(ctx, mod, stem, mdir, funcs, chunk_results, log=print):
         lines.append(f"void {s}(CPU *c);")
     for e in funcs:
         if e in ctx.wraps:
-            lines.append(f"void (*const ovr_orig_{ctx.wraps[e]})(CPU *c) = {ctx.fname(e)};")
+            lines.append(f"void (*const ovr_orig_{ctx.wraps[e]})(CPU *c) = SNX_GUEST_FN({ctx.fname(e)});")
     # переходник (jmp на тело, Ctx.target_info) — в таблице сразу тело: косвенный вызов через vtable не прыгает дважды
     entry = {}
     for e in funcs:
@@ -342,7 +347,7 @@ def _write_module_tail(ctx, mod, stem, mdir, funcs, chunk_results, log=print):
                 entry[e] = (info.sym, 0)
     own = {ctx.fname(e) for e in funcs}
     for s in sorted({s for s, _ in entry.values()} - own - set(ovr_syms)):
-        lines.append(f"void {s}(CPU *c);")
+        lines.append(f"void {s}(SNX_C_PARAM);")
     lines.append("")
     lines.append(f"static const rt_func_entry funcs[] = {{")
     for e in funcs:  # оверрайд — функция хоста (native = 1): регистры гостя ей — через CPU (runtime/abi.h)
@@ -350,9 +355,9 @@ def _write_module_tail(ctx, mod, stem, mdir, funcs, chunk_results, log=print):
             lines.append(f"    {{0x{e:08x}u, {ctx.overrides[e][0]}, 1}},")
         elif e in entry:
             sym, native = entry[e]
-            lines.append(f"    {{0x{e:08x}u, {sym}{', 1' if native else ''}}},")
+            lines.append(f"    {{0x{e:08x}u, {sym}, 1}}," if native else f"    {{0x{e:08x}u, SNX_GUEST_FN({sym})}},")
         else:
-            lines.append(f"    {{0x{e:08x}u, {ctx.fname(e)}}},")
+            lines.append(f"    {{0x{e:08x}u, SNX_GUEST_FN({ctx.fname(e)})}},")
     lines.append("};")
     lines.append(f"static const rt_iat_entry iat[] = {{")
     lines.extend(iat or ["    {0, 0, NULL, NULL},"])

@@ -3,6 +3,8 @@
 // загружен и блокировка не DISCARD), разблокировка загружает уровень целиком. Буферы держат постоянную
 // гостевую копию: Lock отдаёт указатель в неё, изменённый диапазон догружается в GL перед отрисовкой.
 #include <math.h>
+#include <stdatomic.h>
+#include <stddef.h>
 #include <stdlib.h>
 
 #include "runtime/heap.h"
@@ -143,7 +145,7 @@ d3dtex *d3d8_tex_create(u32 w, u32 h, u32 levels, u32 usage, u32 fmt, u32 pool, 
     for (int face = 0; face < (cube ? 6 : 1); face++)
         for (u32 l = 0; l < levels; l++)
             upload_level(t, face, l, NULL);
-    t->obj = com_create(cube ? g_vt_cube : g_vt_tex, t, tex_destroy);
+    t->obj = com_create_st(cube ? g_vt_cube : g_vt_tex, t, tex_destroy);
     return t;
 }
 
@@ -160,19 +162,38 @@ void d3d8_fbo_attach(GLenum fb_target, GLenum attachment, const d3dsurf *s)
         glFramebufferRenderbuffer(fb_target, attachment, GL_RENDERBUFFER, s->rb);
 }
 
-static void surf_destroy(void *p)
+static void x_surf_destroy(void *p)
 {
-    d3dsurf *s = p;
+    d3dsurf *s = *(d3dsurf **)p;
+    d3ddev *d = d3d8_dev();
+    if (d) {
+        if (d->r.rt == s)
+            d->r.rt = NULL;
+        if (d->r.ds == s)
+            d->r.ds = NULL;
+        if (d->r.fbo_rt == s)
+            d->r.fbo_rt = NULL;
+        if (d->r.fbo_ds == s)
+            d->r.fbo_ds = NULL;
+    }
     if (s->rb)
         glDeleteRenderbuffers(1, &s->rb);
     if (s->color_tex)
         glDeleteTextures(1, &s->color_tex);
     if (s->movie_tex)
         glDeleteTextures(1, &s->movie_tex);
+    free(s);
+}
+
+static void surf_destroy(void *p)
+{
+    d3dsurf *s = p;
     if (s->own_mem)
         gfree(s->mem);
     gfree(s->rb_mem);
-    free(s);
+    s->mem = s->rb_mem = 0;
+    // Отложенное удаление GL-объектов и free(s) на Core 2 после всех предшествующих Draw/FBO-команд
+    cs_cmd_push(x_surf_destroy, &s, sizeof s);
 }
 
 static d3dsurf *surf_new(u32 w, u32 h, u32 fmt, u32 usage, u32 pool)
@@ -183,7 +204,7 @@ static d3dsurf *surf_new(u32 w, u32 h, u32 fmt, u32 usage, u32 pool)
     s->fmt = fmt;
     s->usage = usage;
     s->pool = pool;
-    s->obj = com_create(g_vt_surf, s, surf_destroy);
+    s->obj = com_create_st(g_vt_surf, s, surf_destroy);
     return s;
 }
 
@@ -223,6 +244,22 @@ d3dsurf *d3d8_surf_create(u32 w, u32 h, u32 fmt, u32 usage, u32 pool)
     return s;
 }
 
+static void x_tex_destroy(void *p)
+{
+    d3dtex *t = *(d3dtex **)p;
+    d3ddev *d = d3d8_dev();
+    if (d) {
+        for (int s = 0; s < MAX_STAGES; s++)
+            if (d->r.tex[s] == t) {
+                d->r.tex[s] = NULL;
+                d->r.key_dirty = 1;
+            }
+    }
+    if (t->gl)
+        glDeleteTextures(1, &t->gl);
+    free(t);
+}
+
 static void tex_destroy(void *p)
 {
     d3dtex *t = p;
@@ -232,8 +269,9 @@ static void tex_destroy(void *p)
             com_release(t->surf[i]->obj);  // собственный счётчик поверхности уровня всегда 1
         }
     free(t->surf);
-    glDeleteTextures(1, &t->gl);
-    free(t);
+    t->surf = NULL;
+    // Отложенное удаление GL-текстуры и free(t) на Core 2 после всех предшествующих Draw
+    cs_cmd_push(x_tex_destroy, &t, sizeof t);
 }
 
 static d3dsurf *tex_surface(d3dtex *t, int face, u32 level)
@@ -917,6 +955,82 @@ static void surf_LockRect(CPU *c) { RET(4, surf_lock(SURF(c), ARG(1), ARG(2), AR
 static void surf_UnlockRect(CPU *c) { RET(1, surf_unlock(SURF(c))); }
 
 // ================================================================ буферы
+// Бюджет кольцевых zero-copy слотов для USAGE_DYNAMIC в гостевой куче (чтобы не тратить лишние десятки МБ
+// при редких огромных буферах — сверх бюджета буфер безопасно работает через копирование в g_ring).
+#define DYN_ZC_MAX_BUF (2u << 20)
+#define DYN_ZC_BUDGET (32u << 20)
+static _Atomic size_t g_dyn_slot_bytes;
+
+typedef struct {
+    d3dbuf *b;
+    const void *data;
+    void *heap;
+    u32 off, len;
+    u8 orphan, discard;
+} cmd_buf_upload_t;
+
+static void buf_upload_gl(d3dbuf *b, const void *src, u32 off, u32 len, u8 orphan, u8 discard)
+{
+    if (!b || !b->gl || !src || !len)
+        return;
+    glBindBuffer(GL_ARRAY_BUFFER, b->gl);
+    GLenum gl_usage = (b->usage & USAGE_DYNAMIC) ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW;
+    static int glthread = -1;
+    if (glthread < 0)
+        glthread = getenv("SNX_GLTHREAD") != NULL;
+    if (orphan) {
+        if (discard && (off > 0 || len < b->size)) {
+            glBufferData(GL_ARRAY_BUFFER, b->size, NULL, gl_usage);
+            if (glthread)
+                glBufferSubData(GL_ARRAY_BUFFER, off, len, src);
+            else
+                cs_BufferWriteUnsync(GL_ARRAY_BUFFER, off, len, src);
+        } else {
+            glBufferData(GL_ARRAY_BUFFER, b->size, src, gl_usage);
+        }
+    } else if (glthread) {
+        glBufferSubData(GL_ARRAY_BUFFER, off, len, src);
+    } else {
+        cs_BufferWriteUnsync(GL_ARRAY_BUFFER, off, len, src);
+    }
+}
+
+static void x_buf_upload_zc(void *p)
+{
+    const cmd_buf_upload_t *q = p;
+    buf_upload_gl(q->b, q->data, q->off, q->len, q->orphan, q->discard);
+}
+
+static void x_buf_upload_copy(void *p)
+{
+    const cmd_buf_upload_t *q = p;
+    buf_upload_gl(q->b, q->data, q->off, q->len, q->orphan, q->discard);
+    free(q->heap);
+}
+
+static void x_buf_destroy(void *p)
+{
+    d3dbuf *b = *(d3dbuf **)p;
+    d3ddev *d = d3d8_dev();
+    if (d) {
+        for (int i = 0; i < MAX_STREAMS; i++)
+            if (d->r.stream[i] == b)
+                d->r.stream[i] = NULL;
+        if (d->r.indices == b)
+            d->r.indices = NULL;
+    }
+    if (b->gl)
+        glDeleteBuffers(1, &b->gl);
+    for (int i = 0; i < b->nzslots; i++) {
+        if (b->zmem[i]) {
+            gfree(b->zmem[i]);
+            atomic_fetch_sub_explicit(&g_dyn_slot_bytes, b->size, memory_order_relaxed);
+        }
+    }
+    gfree(b->mem);
+    free(b);
+}
+
 static void buf_destroy(void *p)
 {
     d3dbuf *b = p;
@@ -928,9 +1042,8 @@ static void buf_destroy(void *p)
         if (d->indices == b)
             d->indices = NULL;
     }
-    glDeleteBuffers(1, &b->gl);
-    gfree(b->mem);
-    free(b);
+    // Освобождение GL-буфера, гостевых zero-copy слотов и free(b) — на Core 2 после всех предшествующих команд
+    cs_cmd_push(x_buf_destroy, &b, sizeof b);
 }
 
 d3dbuf *d3d8_buf_create(int index, u32 size, u32 usage, u32 fvf_or_fmt, u32 pool)
@@ -940,6 +1053,7 @@ d3dbuf *d3d8_buf_create(int index, u32 size, u32 usage, u32 fvf_or_fmt, u32 pool
     b->size = size;
     b->usage = usage;
     b->pool = pool;
+    b->cur_zslot = -1;
     if (index)
         b->fmt = fvf_or_fmt;
     else
@@ -950,36 +1064,88 @@ d3dbuf *d3d8_buf_create(int index, u32 size, u32 usage, u32 fvf_or_fmt, u32 pool
         return NULL;
     }
     memset(g_mem + b->mem, 0, size);
+    // Для динамических буферов (VB/IB) выделяем DYN_SLOTS кольцевых слотов в гостевой памяти, чтобы Unlock
+    // передавал в gl_cs только 48-байтную ссылку без memcpy вершин/индексов на Core 1.
+    if ((usage & USAGE_DYNAMIC) && size > 0 && size <= DYN_ZC_MAX_BUF) {
+        for (int i = 0; i < DYN_SLOTS; i++) {
+            size_t cur = atomic_load_explicit(&g_dyn_slot_bytes, memory_order_relaxed);
+            if (cur + size > DYN_ZC_BUDGET)
+                break;
+            u32 m = galloc(size);
+            if (!m)
+                break;
+            memset(g_mem + m, 0, size);
+            b->zmem[b->nzslots++] = m;
+            atomic_fetch_add_explicit(&g_dyn_slot_bytes, size, memory_order_relaxed);
+        }
+    }
     glGenBuffers(1, &b->gl);
     glBindBuffer(GL_ARRAY_BUFFER, b->gl);
     glBufferData(GL_ARRAY_BUFFER, size, NULL, (usage & USAGE_DYNAMIC) ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
-    b->obj = com_create(index ? g_vt_ib : g_vt_vb, b, buf_destroy);
+    b->obj = com_create_st(index ? g_vt_ib : g_vt_vb, b, buf_destroy);
     return b;
 }
 
-// Догрузка перед отрисовкой. glBufferSubData в буфер, который GPU ещё читает, ждёт GPU (на маке это съедало
-// ~70 % кадра: D3DDrv гоняет динамические буферы через Lock каждый кадр). Поэтому как в D3D: после Lock без
-// NOOVERWRITE (в т. ч. DISCARD) — новое хранилище с полной гостевой копией, после NOOVERWRITE (приложение
-// обещает не трогать то, что рисуется) — запись без синхронизации с GPU.
+// Чистая логика выбора zero-copy слота для динамического буфера:
+// - LOCK_DISCARD: ищем слот, чей zfence уже пройден Core 2 (tail >= zfence[k]); если все заняты — -1 (fallback).
+// - LOCK_NOOVERWRITE: при активном zero-copy слоте разрешаем запись напрямую, если диапазон не пересекается
+//   с уже отправленным (off >= cur_zhi) или Core 2 уже дочитал этот слот (tail >= zfence[cur_zslot]); иначе -1.
+int d3d8_dyn_slot_pick(int nzslots, int cur_zslot, u32 cur_zhi, const u64 *zfence, uint64_t tail, u32 off, u32 flags)
+{
+    if (nzslots <= 0)
+        return -1;
+    if (flags & LOCK_DISCARD) {
+        int start = cur_zslot >= 0 ? (cur_zslot + 1) % nzslots : 0;
+        for (int i = 0; i < nzslots; i++) {
+            int k = (start + i) % nzslots;
+            if (zfence[k] == 0 || tail >= zfence[k])
+                return k;
+        }
+        return -1;
+    }
+    if ((flags & LOCK_NOOVERWRITE) && cur_zslot >= 0 && cur_zslot < nzslots) {
+        if (off >= cur_zhi || zfence[cur_zslot] == 0 || tail >= zfence[cur_zslot])
+            return cur_zslot;
+        return -1;
+    }
+    return -1;
+}
+
+static void buf_unlock_flush(d3dbuf *b)
+{
+    if (!b || !b->locked)
+        return;
+    b->locked = 0;
+    u32 flags = b->lock_flags, off = b->lock_off, len = b->lock_size;
+    if ((flags & LOCK_READONLY) || !len)
+        return;
+    u8 discard = (flags & LOCK_DISCARD) != 0;
+    u8 orphan = !(flags & LOCK_NOOVERWRITE);
+    if (b->lock_zc && b->cur_zslot >= 0) {
+        int k = b->cur_zslot;
+        cmd_buf_upload_t cmd = {b, g_mem + b->zmem[k] + off, NULL, off, len, orphan, discard};
+        cs_cmd_push(x_buf_upload_zc, &cmd, sizeof cmd);
+        b->zfence[k] = cs_enabled() ? cs_wr_pos() : 0;
+        if (off + len > b->cur_zhi)
+            b->cur_zhi = off + len;
+    } else if (orphan && !discard) {
+        // Без DISCARD и без NOOVERWRITE: сохранить прежние данные вне [off, off + len)
+        cmd_buf_upload_t cmd = {b, g_mem + b->mem, NULL, 0, b->size, 1, 0};
+        cs_cmd_push_var(x_buf_upload_copy, &cmd, sizeof cmd, g_mem + b->mem, b->size,
+                        offsetof(cmd_buf_upload_t, data), offsetof(cmd_buf_upload_t, heap));
+    } else {
+        // Fallback при занятых слотах или static-буфере с DISCARD/NOOVERWRITE: копируем в кольцо только [off, off+len)
+        cmd_buf_upload_t cmd = {b, g_mem + b->mem + off, NULL, off, len, orphan, discard};
+        cs_cmd_push_var(x_buf_upload_copy, &cmd, sizeof cmd, g_mem + b->mem + off, len,
+                        offsetof(cmd_buf_upload_t, data), offsetof(cmd_buf_upload_t, heap));
+    }
+}
+
 void d3d8_buf_sync(d3dbuf *b)
 {
-    if (b->dirty_hi <= b->dirty_lo)
-        return;
-    glBindBuffer(GL_ARRAY_BUFFER, b->gl);
-    u32 lo = b->dirty_lo, len = b->dirty_hi - b->dirty_lo;
-    static int glthread = -1;
-    if (glthread < 0)
-        glthread = getenv("SNX_GLTHREAD") != NULL;
-    if (b->orphan) {
-        glBufferData(GL_ARRAY_BUFFER, b->size, g_mem + b->mem,
-                     (b->usage & USAGE_DYNAMIC) ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
-    } else if (glthread) {
-        // glthread Mesa: отображение буфера ждало бы поток драйвера — только копия в его очередь
-        glBufferSubData(GL_ARRAY_BUFFER, lo, len, g_mem + b->mem + lo);
-    } else
-        cs_BufferWriteUnsync(GL_ARRAY_BUFFER, lo, len, g_mem + b->mem + lo);
-    b->orphan = 0;
-    b->dirty_lo = b->dirty_hi = 0;
+    // Заливка происходит на Unlock(); здесь только защитный сброс, если приложение забыло Unlock перед Draw.
+    if (b && b->locked)
+        buf_unlock_flush(b);
 }
 
 #define BUF(c) ((d3dbuf *)com_host(ARG(0)))
@@ -994,24 +1160,49 @@ static void buf_Lock(CPU *c)  // (OffsetToLock, SizeToLock, ppbData, Flags)
         RET(5, D3DERR_INVALIDCALL);
     if (!size || off + size > b->size)
         size = b->size - off;
-    if (!(flags & LOCK_READONLY)) {
-        if (!(flags & LOCK_NOOVERWRITE))
-            b->orphan = 1;
-        if (b->dirty_hi <= b->dirty_lo) {
-            b->dirty_lo = off;
-            b->dirty_hi = off + size;
+    if (b->locked)
+        buf_unlock_flush(b);
+    b->locked = 1;
+    b->lock_off = off;
+    b->lock_size = size;
+    b->lock_flags = flags;
+    b->lock_zc = 0;
+    u32 base = b->mem;
+    if (flags & LOCK_READONLY) {
+        base = b->cur_zslot >= 0 ? b->zmem[b->cur_zslot] : b->mem;
+    } else if (b->nzslots > 0 && (flags & (LOCK_DISCARD | LOCK_NOOVERWRITE))) {
+        uint64_t tail = cs_tail_pos();
+        int k = d3d8_dyn_slot_pick(b->nzslots, b->cur_zslot, b->cur_zhi, b->zfence, tail, off, flags);
+        if (k >= 0) {
+            if (flags & LOCK_DISCARD) {
+                b->cur_zslot = k;
+                b->cur_zhi = 0;
+            }
+            b->lock_zc = 1;
+            base = b->zmem[k];
         } else {
-            if (off < b->dirty_lo)
-                b->dirty_lo = off;
-            if (off + size > b->dirty_hi)
-                b->dirty_hi = off + size;
+            if (flags & LOCK_DISCARD) {
+                b->cur_zslot = -1;
+                b->cur_zhi = 0;
+            }
+            base = b->mem;
         }
+    } else if (!(flags & (LOCK_DISCARD | LOCK_NOOVERWRITE)) && b->cur_zslot >= 0) {
+        // Редкий Lock(0) после zero-copy DISCARD: переносим актуальное содержимое слота в b->mem (только чтение слота)
+        memcpy(g_mem + b->mem, g_mem + b->zmem[b->cur_zslot], b->size);
+        b->cur_zslot = -1;
+        b->cur_zhi = 0;
+        base = b->mem;
     }
-    wr32(g_mem, ARG(3), b->mem + off);
+    wr32(g_mem, ARG(3), base + off);
     RET(5, D3D_OK);
 }
 
-static void buf_Unlock(CPU *c) { RET(1, D3D_OK); }
+static void buf_Unlock(CPU *c)
+{
+    buf_unlock_flush(BUF(c));
+    RET(1, D3D_OK);
+}
 
 // D3DVERTEXBUFFER_DESC: Format, Type, Usage, Pool, Size, FVF; D3DINDEXBUFFER_DESC: Format, Type, Usage, Pool, Size
 static void buf_GetDesc(CPU *c)

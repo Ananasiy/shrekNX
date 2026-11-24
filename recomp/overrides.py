@@ -25,6 +25,11 @@ WRAPS["Core.dll!?LoadConfig@UObject@@QAEXHPAVUClass@@PBG@Z"] = ("ovr_core_load_c
 SIGS["objit_next"] = ("8B 41 04 40 89 41 04 3B 05 ? ? ? ? 7D ? 8B 15 ? ? ? ? 8B 04 82 85 C0 74 ? 8B 40 24 85 C0 8B 11 "
                       "74 ? 3B C2 74 ? 8B 40 2C 85 C0 75 ? 33 C0 85 D2 0F 94 C0 85 C0 74 ? C3")
 WRAPS["Core.dll!=objit_next"] = ("ovr_core_objit_next", 0)
+# Core: быстрые листовые функции (сравнение памяти, геометрия FBox/FVector; runtime/overrides_core.c)
+OVERRIDES["Core.dll!?appMemcmp@@YAHPBX0H@Z"] = ("ovr_core_memcmp", 0)
+WRAPS["Core.dll!??YFBox@@QAEAAV0@ABVFVector@@@Z"] = ("ovr_core_box_add_vec", 0)
+WRAPS["Core.dll!?SafeNormal@FVector@@QBE?AV1@XZ"] = ("ovr_core_vec_safe_normal", 0)
+WRAPS["Core.dll!?Normalize@FVector@@QAEHXZ"] = ("ovr_core_vec_normalize", 0)
 # memcpy из статического CRT — своя копия у каждого модуля, хвосты — переходами по вычисленному адресу
 SIGS["memcpy"] = "55 8B EC 53 56 57 A1 ? ? ? ? 83 38 00 0F 84 ? ? ? ? 8B 4D 10 8B 7D 08 8B 75 0C 8B D9 FC"
 for _m in ["Engine.dll", "D3DDrv.dll", "ALAudio.dll", "Fire.dll", "GUI.dll", "IpDrv.dll", "KWGame.dll", "Window.dll",
@@ -51,6 +56,32 @@ WRAPS["Engine.dll!?UpdateMatrices@FCameraSceneNode@@UAEXXZ"] = ("ovr_engine_came
 # Engine: без сброса ресурсов рендера сразу после сохранения (runtime/overrides_engine.c)
 WRAPS["Engine.dll!?SaveGame@UGameEngine@@UAEXH@Z"] = ("ovr_engine_save_game", 0)
 WRAPS["Engine.dll!?Flush@UEngine@@UAEXH@Z"] = ("ovr_engine_flush", 0)
+# Engine: NEON/нативное отсечение по пирамиде видимости (в оригинале SSE отключён по CPUID; runtime/overrides_engine.c)
+WRAPS["Engine.dll!?BoxCheck@FConvexVolume@@QAEEABVFVector@@0@Z"] = ("ovr_engine_box_check", 0)
+WRAPS["Engine.dll!?SphereCheck@FConvexVolume@@QAEEABVFSphere@@@Z"] = ("ovr_engine_sphere_check", 0)
+# Engine: CPU-скиннинг скелетных мешей (MeshSkinVerts, Engine.dll!0x121ed630, не экспортирована; runtime/overrides_engine.c)
+SIGS["skin_verts"] = ("6A FF 68 ? ? ? ? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 81 EC FC 00 00 00 "
+                      "53 55 56 57 0F 31 F7 D8 8D 8C 24 84 00 00 00")
+WRAPS["Engine.dll!=skin_verts"] = ("ovr_engine_skin_verts", 0)
+# Engine: генерация вершинного буфера спрайтовых частиц (Engine.dll!0x122039d0; runtime/overrides_engine.c)
+WRAPS["Engine.dll!?FillVertexBuffer@USpriteEmitter@@UAEHPAVFSpriteParticleVertex@@PAVFLevelSceneNode@@@Z"] = (
+    "ovr_engine_sprite_fill_vb", 0)
+# Engine: 1-проходное GPU-размытие теней-проекторов вместо 9x FCanvasUtil::DrawTile (runtime/overrides_engine.c)
+WRAPS["Engine.dll!?Get@UShadowBitmapMaterial@@UAEPAVUBitmapMaterial@@NPAVUViewport@@@Z"] = (
+    "ovr_engine_shadow_get", 0)
+WRAPS["Engine.dll!?DrawTile@FCanvasUtil@@QAEXMMMMMMMMMPAVUMaterial@@VFColor@@@Z"] = (
+    "ovr_engine_shadow_draw_tile", 0)
+
+# D3DDrv: горячий слой состояния D3D8 напрямую поверх d3d8_direct.h без COM-трамплинов (runtime/overrides_engine.c)
+SIGS["d3d_commit_state"] = ("55 8B EC 6A FF 68 ? ? ? ? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 "
+                            "83 EC 28 8B C1 89 4D EC 8B 08 8B 91 94 09 03 00")
+WRAPS["D3DDrv.dll!=d3d_commit_state"] = ("ovr_d3ddrv_commit_state", 0)
+SIGS["d3d_set_mat_pass"] = ("55 8B EC 6A FF 68 ? ? ? ? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 "
+                            "83 EC 10 89 4D EC 8B C1 8B 88 0C AA 02 00 8B 91 50 05 00 00")
+WRAPS["D3DDrv.dll!=d3d_set_mat_pass"] = ("ovr_d3ddrv_set_mat_pass", 0)
+SIGS["d3d_ehvec_ctor"] = ("8B 44 24 0C 48 78 26 53 8B 5C 24 14 55 8B 6C 24 10 56 8B 74 24 10 57 "
+                          "8D 78 01 8D 9B 00 00 00 00 8B CE FF D3 03 F5 4F 75 F7 5F 5E 5D 5B C2 10 00")
+WRAPS["D3DDrv.dll!=d3d_ehvec_ctor"] = ("ovr_d3ddrv_ehvec_ctor", 0)
 
 # msvcr70: математика (внутри — x87-трюки с нестандартной передачей стека, статически не переводится)
 for _n in ["acos", "asin", "atan", "atan2", "ceil", "cos", "cosh", "exp", "fabs", "floor", "fmod", "frexp",
@@ -60,6 +91,8 @@ for _n in ["acos", "asin", "atan", "atan2", "ceil", "cos", "cosh", "exp", "fabs"
 # msvcr70: rand/srand без _getptd (три вызова HLE на каждое число; runtime/overrides_crt.c)
 OVERRIDES["msvcr70.dll!rand"] = ("ovr_crt_rand", 0)
 OVERRIDES["msvcr70.dll!srand"] = ("ovr_crt_srand", 0)
+# msvcr70: нативный qsort с быстрым путём для 16-байтной сортировки примитивов рендера (runtime/overrides_crt.c)
+WRAPS["msvcr70.dll!qsort"] = ("ovr_crt_qsort", 0)
 
 
 def _match_sig(img, sig):

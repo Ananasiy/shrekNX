@@ -44,7 +44,11 @@ if(NINTENDO_SWITCH)
   endif()
 endif()
 set(SNX_GEN_FLAGS $<$<BOOL:${SNX_TRACE}>:-DSNX_TRACE> -Wno-unused-label -Wno-parentheses-equality -Wno-unused-variable
-    -Wno-unused-but-set-variable -Wno-unused-function -fno-strict-aliasing)
+    -Wno-unused-but-set-variable -Wno-unused-function -fno-strict-aliasing -fno-math-errno -fno-trapping-math)
+if(SNX_PIN)
+  # CPU *c закреплён в x28 (runtime/gen_rt.h): -ffixed-x28 гарантирует сохранность x28 во всех функциях гостя
+  list(APPEND SNX_GEN_FLAGS -ffixed-x28)
+endif()
 
 # snx_gen_module(<stem>) -> цель snx_gen_<stem>, если каталог существует
 function(snx_gen_module stem)

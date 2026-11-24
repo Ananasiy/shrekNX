@@ -6,8 +6,11 @@
 
 #include "platform/window.h"
 #include "runtime/hle/d3d8.h"
+#include "runtime/hle/d3d8_direct.h"
 #include "runtime/hle/d3d8_int.h"
 #include "runtime/hle/user32.h"
+
+_Static_assert(sizeof(d3dlight) == 104, "D3DLIGHT8 must be 104 bytes");
 
 static d3ddev *g_dev;
 static u32 g_vt_dev;
@@ -115,56 +118,18 @@ static void set_defaults(d3ddev *d)
     d->vp[3] = d->bb_h;
     d->vpz[0] = 0.0f;
     d->vpz[1] = 1.0f;
-    d->sampler_dirty = 0xFF;
-    d->gen_xf++;
-    d->gen_view++;
-    d->gen_texm++;
-    d->gen_vp++;
-    d->gen_clip++;
-    d->gen_light++;
-    d->gen_mat++;
-    d->gen_const++;
-    d->gen_psc++;
-    d->gen_bump++;
-    d->gl_dirty = GLD_ALL;
+    d3d8_cmd_reset_defaults(d, d->autodepth != NULL, d->bb_w, d->bb_h);
 }
 
 // ================================================================ гранулярное изменение состояния и StateBlocks
-// Вспомогательные функции изменения состояния устройства (общие для Set* и ApplyStateBlock)
+// Вспомогательные функции изменения состояния устройства (общие для Set* и ApplyStateBlock):
+// обновляют теневое состояние Core 1, отбрасывают дубликаты и ставят компактную D3D8-команду в gl_cs.
 static void apply_rs(d3ddev *d, u32 state, u32 val)
 {
     if (state >= 256 || d->rs[state] == val)
         return;
     d->rs[state] = val;
-    switch (state) {
-    case 7: case 14: case 23:
-        d->gl_dirty |= GLD_DEPTH;
-        break;
-    case 8: case 47:
-        d->gl_dirty |= GLD_POLY;
-        break;
-    case 19: case 20: case 27: case 171:
-        d->gl_dirty |= GLD_BLEND;
-        break;
-    case 22:
-        d->gl_dirty |= GLD_CULL;
-        break;
-    case 24: case 34: case 36: case 37: case 38: case 60: case 139:
-        d->gen_const++;
-        break;
-    case 52: case 53: case 54: case 55: case 56: case 57: case 58: case 59:
-        d->gl_dirty |= GLD_STENCIL;
-        break;
-    case 152:
-        d->gl_dirty |= GLD_CLIP;
-        break;
-    case 168:
-        d->gl_dirty |= GLD_COLORMASK;
-        break;
-    default:
-        // Остальные RS влияют только на ключ шейдера ffkey
-        break;
-    }
+    d3d8_cmd_rs(d, state, val);
 }
 
 static void apply_tss(d3ddev *d, u32 s, u32 t, u32 val)
@@ -172,10 +137,7 @@ static void apply_tss(d3ddev *d, u32 s, u32 t, u32 val)
     if (s >= MAX_STAGES || t >= 32 || d->tss[s][t] == val)
         return;
     d->tss[s][t] = val;
-    if (t >= 7 && t <= 10)
-        d->gen_bump++;
-    else if ((t >= 13 && t <= 21) || t == 25)
-        d->sampler_dirty |= 1u << s;
+    d3d8_cmd_tss(d, s, t, val);
 }
 
 static void apply_tex(d3ddev *d, u32 s, d3dtex *t)
@@ -187,12 +149,14 @@ static void apply_tex(d3ddev *d, u32 s, d3dtex *t)
     if (d->tex[s])
         com_release(d->tex[s]->obj);
     d->tex[s] = t;
-    // SetTexture не трогает матрицы, viewport, GL render states и константы
+    d3d8_cmd_tex(d, s, t);
 }
 
 static void apply_stream(d3ddev *d, u32 n, d3dbuf *b, u32 stride)
 {
     if (n >= MAX_STREAMS)
+        return;
+    if (b == d->stream[n] && stride == d->stride[n])
         return;
     if (b != d->stream[n]) {
         if (b)
@@ -202,10 +166,13 @@ static void apply_stream(d3ddev *d, u32 n, d3dbuf *b, u32 stride)
         d->stream[n] = b;
     }
     d->stride[n] = stride;
+    d3d8_cmd_stream(d, n, b, stride);
 }
 
 static void apply_indices(d3ddev *d, d3dbuf *b, u32 base_vertex)
 {
+    if (b == d->indices && base_vertex == d->base_vertex)
+        return;
     if (b != d->indices) {
         if (b)
             com_addref(b->obj);
@@ -214,24 +181,105 @@ static void apply_indices(d3ddev *d, d3dbuf *b, u32 base_vertex)
         d->indices = b;
     }
     d->base_vertex = base_vertex;
+    d3d8_cmd_indices(d, b, base_vertex);
 }
 
 static void apply_xf(d3ddev *d, u32 state, const float *mat)
 {
-    if (state == 2) {
-        memcpy(d->view, mat, 64);
-        d->gen_xf++;
-        d->gen_view++;
-    } else if (state == 3) {
-        memcpy(d->proj, mat, 64);
-        d->gen_xf++;
-    } else if (state == 256) {
-        memcpy(d->world, mat, 64);
-        d->gen_xf++;
-    } else if (state >= 16 && state < 16 + MAX_STAGES) {
-        memcpy(d->texm[state - 16], mat, 64);
-        d->gen_texm++;
+    float *slot = NULL;
+    if (state == 2)
+        slot = d->view;
+    else if (state == 3)
+        slot = d->proj;
+    else if (state == 256)
+        slot = d->world;
+    else if (state >= 16 && state < 16 + MAX_STAGES)
+        slot = d->texm[state - 16];
+    if (!slot || memcmp(slot, mat, 64) == 0)
+        return;
+    memcpy(slot, mat, 64);
+    d3d8_cmd_xf(d, state, mat);
+}
+
+static void apply_vp(d3ddev *d, const u32 vp[4], const float vpz[2])
+{
+    if (!memcmp(d->vp, vp, sizeof d->vp) && !memcmp(d->vpz, vpz, sizeof d->vpz))
+        return;
+    memcpy(d->vp, vp, sizeof d->vp);
+    memcpy(d->vpz, vpz, sizeof d->vpz);
+    d3d8_cmd_vp(d, vp, vpz);
+}
+
+static void apply_mat(d3ddev *d, const float mat[17])
+{
+    if (!memcmp(d->material, mat, sizeof d->material))
+        return;
+    memcpy(d->material, mat, sizeof d->material);
+    d3d8_cmd_mat(d, mat);
+}
+
+static void apply_light(d3ddev *d, u32 i, const d3dlight *l)
+{
+    if (i >= MAX_LIGHTS)
+        return;
+    if (d->light_set[i] && !memcmp(&d->lights[i], l, sizeof *l))
+        return;
+    d->lights[i] = *l;
+    d->light_set[i] = 1;
+    d3d8_cmd_light(d, i, l);
+}
+
+static void apply_light_enable(d3ddev *d, u32 i, u8 on)
+{
+    if (i >= MAX_LIGHTS)
+        return;
+    if (!d->light_set[i]) {  // как D3D: включение незаданного источника — белый направленный (0,0,1)
+        d3dlight def = {0};
+        def.type = 3;
+        def.diffuse[0] = def.diffuse[1] = def.diffuse[2] = 1.0f;
+        def.dir[2] = 1.0f;
+        apply_light(d, i, &def);
+    } else if (d->light_on[i] == on) {
+        return;
     }
+    d->light_on[i] = on;
+    d3d8_cmd_light_enable(d, i, on);
+}
+
+static void apply_clip(d3ddev *d, u32 i, const float plane[4])
+{
+    if (i >= 6 || !memcmp(d->clip[i], plane, 16))
+        return;
+    memcpy(d->clip[i], plane, 16);
+    d3d8_cmd_clip(d, i, plane);
+}
+
+static void apply_vs(d3ddev *d, u32 vs)
+{
+    if (d->vs == vs)
+        return;
+    d->vs = vs;
+    d3d8_cmd_vs(d, vs);
+}
+
+static void apply_ps(d3ddev *d, u32 ps)
+{
+    if (d->ps == ps)
+        return;
+    d->ps = ps;
+    d3d8_cmd_ps(d, ps);
+}
+
+static void apply_psc(d3ddev *d, u32 reg, u32 cnt, const void *src)
+{
+    if (reg >= 8 || !cnt)
+        return;
+    if (reg + cnt > 8)
+        cnt = 8 - reg;
+    if (!memcmp(d->psc[reg], src, (size_t)cnt * 16u))
+        return;
+    memcpy(d->psc[reg], src, (size_t)cnt * 16u);
+    d3d8_cmd_psc(d, reg, cnt, (const float (*)[4])d->psc[reg]);
 }
 
 struct d3d_sb {
@@ -414,35 +462,20 @@ static void sb_apply(d3ddev *d, const d3d_sb *s)
     for (int stg = 0; stg < MAX_STAGES; stg++)
         if (s->xf_texm_mask & (1u << stg))
             apply_xf(d, 16u + (u32)stg, s->texm[stg]);
-    if (s->has_vp) {
-        memcpy(d->vp, s->vp, sizeof d->vp);
-        memcpy(d->vpz, s->vpz, sizeof d->vpz);
-        d->gen_vp++;
-        d->gl_dirty |= GLD_VP;
+    if (s->has_vp)
+        apply_vp(d, s->vp, s->vpz);
+    if (s->has_mat)
+        apply_mat(d, s->material);
+    for (u32 i = 0; i < MAX_LIGHTS; i++) {
+        if ((s->light_mask & (1u << i)) && s->light_set[i])
+            apply_light(d, i, &s->lights[i]);
+        if (s->light_en_mask & (1u << i))
+            apply_light_enable(d, i, s->light_on[i]);
     }
-    if (s->has_mat) {
-        memcpy(d->material, s->material, sizeof d->material);
-        d->gen_mat++;
-    }
-    int light_ch = 0;
-    for (int i = 0; i < MAX_LIGHTS; i++) {
-        if (s->light_mask & (1u << i)) {
-            d->lights[i] = s->lights[i];
-            d->light_set[i] = s->light_set[i];
-            light_ch = 1;
-        }
-        if (s->light_en_mask & (1u << i)) {
-            d->light_on[i] = s->light_on[i];
-            light_ch = 1;
-        }
-    }
-    if (light_ch)
-        d->gen_light++;
     if (s->clip_mask) {
-        for (int i = 0; i < 6; i++)
+        for (u32 i = 0; i < 6; i++)
             if (s->clip_mask & (1u << i))
-                memcpy(d->clip[i], s->clip[i], 16);
-        d->gen_clip++;
+                apply_clip(d, i, s->clip[i]);
     }
     for (u32 n = 0; n < MAX_STREAMS; n++)
         if (s->stream_mask & (1u << n))
@@ -450,17 +483,16 @@ static void sb_apply(d3ddev *d, const d3d_sb *s)
     if (s->has_indices)
         apply_indices(d, s->indices, s->base_vertex);
     if (s->has_vs)
-        d->vs = s->vs;
+        apply_vs(d, s->vs);
     if (s->has_ps)
-        d->ps = s->ps;
+        apply_ps(d, s->ps);
     for (u32 i = 0; i < 96; i++)
         if (s->vsc_mask[i >> 5] & (1u << (i & 31)))
             memcpy(d->vsc[i], s->vsc[i], 16);
     if (s->psc_mask) {
         for (u32 i = 0; i < 8; i++)
             if (s->psc_mask & (1u << i))
-                memcpy(d->psc[i], s->psc[i], 16);
-        d->gen_psc++;
+                apply_psc(d, i, 1, s->psc[i]);
     }
 }
 
@@ -541,7 +573,7 @@ static void sb_init_type(d3d_sb *s, u32 type)
 enum { DT_FLOAT1, DT_FLOAT2, DT_FLOAT3, DT_FLOAT4, DT_D3DCOLOR, DT_UBYTE4, DT_SHORT2, DT_SHORT4 };
 static const u8 g_dt_size[8] = {4, 8, 12, 16, 4, 4, 4, 8};
 
-#define MAX_VS 512
+#define MAX_VS D3D8_MAX_VS
 typedef struct {
     int used;
     vdecl decl;
@@ -549,7 +581,7 @@ typedef struct {
     u32 ntok;
 } vshader;
 static vshader g_vs[MAX_VS];
-#define VS_HANDLE_BASE 0xF0000001u
+#define VS_HANDLE_BASE D3D8_VS_HANDLE_BASE
 
 static void add_elem(vdecl *v, u32 stream, u32 reg, u32 type, u32 offset)
 {
@@ -557,7 +589,7 @@ static void add_elem(vdecl *v, u32 stream, u32 reg, u32 type, u32 offset)
         v->e[v->n++] = (velem){(u8)stream, (u8)reg, (u8)type, (u8)offset};
 }
 
-static void decl_from_fvf(u32 fvf, vdecl *v)
+void d3d8_decl_from_fvf(u32 fvf, vdecl *v)
 {
     memset(v, 0, sizeof *v);
     u32 off = 0, pos = fvf & 0xE;
@@ -649,19 +681,6 @@ static u32 parse_decl(d3ddev *d, u32 p, vdecl *v)
     return n + 1;
 }
 
-int d3d8_vdecl_for(d3ddev *d, vdecl *out)
-{
-    if (d->vs < VS_HANDLE_BASE) {
-        decl_from_fvf(d->vs, out);
-        return out->n > 0;
-    }
-    u32 i = d->vs - VS_HANDLE_BASE;
-    if (i >= MAX_VS || !g_vs[i].used)
-        return 0;
-    *out = g_vs[i].decl;
-    return 1;
-}
-
 // ================================================================ IDirect3DDevice8
 #define DEV(c) ((d3ddev *)com_host(ARG(0)))
 
@@ -742,7 +761,6 @@ static void make_backbuffer(d3ddev *d)
     surf_ref(d->backbuffer, 0);
     surf_ref(d->autodepth, 0);
     d->rt = d->ds = d->backbuffer = d->autodepth = NULL;
-    d->fbo_rt = d->fbo_ds = NULL;
     d->backbuffer = d3d8_surf_create(d->bb_w, d->bb_h, FMT_A8R8G8B8, USAGE_RENDERTARGET, POOL_DEFAULT);
     d->backbuffer->fmt = d->bb_fmt;
     d->backbuffer->backbuffer = 1;
@@ -795,7 +813,7 @@ static void apply_pp(d3ddev *d, u32 pp)
     plat_window_open((int)d->bb_w, (int)d->bb_h, !d->windowed, "Shrek 2");
     make_backbuffer(d);
     set_defaults(d);
-    d3d8_bind_target(d);
+    d3d8_cmd_set_rt(d, d->rt, d->ds, 1);
 }
 
 static void dev_Reset(CPU *c)
@@ -947,8 +965,6 @@ static void dev_SetRenderTarget(CPU *c)
 {
     d3ddev *d = DEV(c);
     d3dsurf *rt = d3d8_surf_from(ARG(1)), *ds = d3d8_surf_from(ARG(2));
-    if (d3d8_dumping(d) && d->rt && d->rt->tex)
-        d3d8_dump_target(d);  // текстура-цель, которую покидаем
     if (rt && rt != d->rt) {
         surf_ref(rt, 1);
         surf_ref(d->rt, 0);
@@ -959,16 +975,13 @@ static void dev_SetRenderTarget(CPU *c)
         surf_ref(d->ds, 0);
         d->ds = ds;
     }
-    if (d3d8_dumping(d))
-        fprintf(stderr, "[dump] SetRenderTarget %ux%u fmt %x%s ds %ux%u\n", d->rt->w, d->rt->h, d->rt->fmt,
-                d->rt->tex ? " (texture)" : "", d->ds ? d->ds->w : 0, d->ds ? d->ds->h : 0);
     // как D3D: viewport — вся новая цель
     d->vp[0] = d->vp[1] = 0;
     d->vp[2] = d->rt->w;
     d->vp[3] = d->rt->h;
     d->vpz[0] = 0.0f;
     d->vpz[1] = 1.0f;
-    d3d8_bind_target(d);
+    d3d8_cmd_set_rt(d, d->rt, d->ds, 1);
     RET(3, D3D_OK);
 }
 
@@ -998,48 +1011,25 @@ static void dev_Clear(CPU *c)
     d3ddev *d = DEV(c);
     u32 count = ARG(1), rects = ARG(2), flags = ARG(3), color = ARG(4), stencil = ARG(6);
     float z = u2f(ARG(5));
-    GLbitfield mask = 0;
-    if (flags & 1) {
-        mask |= GL_COLOR_BUFFER_BIT;
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        glClearColor((float)((color >> 16) & 0xFF) / 255.0f, (float)((color >> 8) & 0xFF) / 255.0f,
-                     (float)(color & 0xFF) / 255.0f, (float)(color >> 24) / 255.0f);
-    }
-    if ((flags & 2) && d->ds) {
-        mask |= GL_DEPTH_BUFFER_BIT;
-        glDepthMask(GL_TRUE);
-        glClearDepth(z);
-    }
-    if ((flags & 4) && d->ds) {
-        mask |= GL_STENCIL_BUFFER_BIT;
-        glStencilMask(0xFF);
-        glClearStencil((GLint)stencil);
-    }
-    if (d3d8_dumping(d))
-        fprintf(stderr, "[dump] Clear flags %x color %08x z %g rects %u vp %u,%u %ux%u\n", flags, color, z, count,
-                d->vp[0], d->vp[1], d->vp[2], d->vp[3]);
-    if (mask) {
-        glEnable(GL_SCISSOR_TEST);
-        if (!count || !rects) {
-            glScissor((GLint)d->vp[0], (GLint)d->vp[1], (GLsizei)d->vp[2], (GLsizei)d->vp[3]);
-            glClear(mask);
-        }
-        for (u32 i = 0; rects && i < count; i++) {
-            s32 x1 = (s32)rd32(g_mem, rects + 16 * i), y1 = (s32)rd32(g_mem, rects + 16 * i + 4);
-            s32 x2 = (s32)rd32(g_mem, rects + 16 * i + 8), y2 = (s32)rd32(g_mem, rects + 16 * i + 12);
-            if (x2 > x1 && y2 > y1) {
-                glScissor(x1, y1, x2 - x1, y2 - y1);
-                glClear(mask);
+    s32 sbuf[32];  // до 8 прямоугольников на стеке без аллокаций
+    s32 *rbuf = NULL;
+    u32 nrect = (count && rects) ? count : 0;
+    if (nrect) {
+        rbuf = nrect <= 8 ? sbuf : malloc((size_t)nrect * 4u * sizeof(s32));
+        if (rbuf) {
+            for (u32 i = 0; i < nrect; i++) {
+                rbuf[4u * i + 0] = (s32)rd32(g_mem, rects + 16u * i);
+                rbuf[4u * i + 1] = (s32)rd32(g_mem, rects + 16u * i + 4u);
+                rbuf[4u * i + 2] = (s32)rd32(g_mem, rects + 16u * i + 8u);
+                rbuf[4u * i + 3] = (s32)rd32(g_mem, rects + 16u * i + 12u);
             }
+        } else {
+            nrect = 0;
         }
-        d->gl_dirty |= GLD_SCISSOR;
-        if (flags & 1)
-            d->gl_dirty |= GLD_COLORMASK;
-        if ((flags & 2) && d->ds)
-            d->gl_dirty |= GLD_DEPTH;
-        if ((flags & 4) && d->ds)
-            d->gl_dirty |= GLD_STENCIL;
     }
+    d3d8_cmd_clear(d, flags, color, z, stencil, nrect, rbuf);
+    if (rbuf && rbuf != sbuf)
+        free(rbuf);
     RET(7, D3D_OK);
 }
 
@@ -1056,32 +1046,308 @@ static float *xf_slot(d3ddev *d, u32 state)
     return NULL;
 }
 
-static void dev_SetTransform(CPU *c)
+// ================================================================ прямой C-интерфейс (d3d8_direct.h)
+// Используется нативными оверрайдами D3DDrv/Engine и самими COM-методами dev_Set*:
+// минует COM-трамплины и x86-стек, сохраняет полную совместимость с StateBlock (d->rec_sb)
+// и отсекает повторную привязку тех же гостевых ресурсов без AddRef/Release.
+struct d3ddev *d3d8_dev_from_guest(u32 guest_ptr)
 {
-    d3ddev *d = DEV(c);
-    u32 st = ARG(1);
-    if (!xf_slot(d, st))
-        RET(3, D3D_OK);
+    if (!guest_ptr)
+        return NULL;
+    if (g_dev && guest_ptr == g_dev->obj)
+        return g_dev;
+    return (d3ddev *)com_host(guest_ptr);
+}
+
+void d3d8_direct_set_rs(struct d3ddev *d, u32 state, u32 val)
+{
+    if (!d)
+        return;
+    if (d->rec_sb) {
+        if (state < 256) {
+            d->rec_sb->rs[state] = val;
+            sb_set_rs_bit(d->rec_sb, state);
+        }
+        return;
+    }
+    apply_rs(d, state, val);
+}
+
+void d3d8_direct_set_tss(struct d3ddev *d, u32 stage, u32 type, u32 val)
+{
+    if (!d)
+        return;
+    if (d->rec_sb) {
+        if (stage < MAX_STAGES && type < 32) {
+            d->rec_sb->tss[stage][type] = val;
+            d->rec_sb->tss_mask[stage] |= 1u << type;
+        }
+        return;
+    }
+    apply_tss(d, stage, type, val);
+}
+
+void d3d8_direct_set_transform(struct d3ddev *d, u32 type, const float *mat16)
+{
+    if (!d || !mat16 || !xf_slot(d, type))
+        return;
     float mat[16];
-    memcpy(mat, g_mem + ARG(2), 64);
+    memcpy(mat, mat16, 64);
     if (d->rec_sb) {
         d3d_sb *sb = d->rec_sb;
-        if (st == 2) {
+        if (type == 2) {
             memcpy(sb->view, mat, 64);
             sb->xf_view = 1;
-        } else if (st == 3) {
+        } else if (type == 3) {
             memcpy(sb->proj, mat, 64);
             sb->xf_proj = 1;
-        } else if (st == 256) {
+        } else if (type == 256) {
             memcpy(sb->world, mat, 64);
             sb->xf_world = 1;
-        } else if (st >= 16 && st < 16 + MAX_STAGES) {
-            memcpy(sb->texm[st - 16], mat, 64);
-            sb->xf_texm_mask |= (u8)(1u << (st - 16));
+        } else if (type >= 16 && type < 16 + MAX_STAGES) {
+            memcpy(sb->texm[type - 16], mat, 64);
+            sb->xf_texm_mask |= (u8)(1u << (type - 16));
         }
-        RET(3, D3D_OK);
+        return;
     }
-    apply_xf(d, st, mat);
+    apply_xf(d, type, mat);
+}
+
+void d3d8_direct_set_material(struct d3ddev *d, const void *mat68)
+{
+    if (!d || !mat68)
+        return;
+    if (d->rec_sb) {
+        memcpy(d->rec_sb->material, mat68, sizeof d->rec_sb->material);
+        d->rec_sb->has_mat = 1;
+        return;
+    }
+    float mat[17];
+    memcpy(mat, mat68, sizeof mat);
+    apply_mat(d, mat);
+}
+
+void d3d8_direct_set_light(struct d3ddev *d, u32 idx, const void *light104)
+{
+    if (!d || !light104)
+        return;
+    if (idx < MAX_LIGHTS) {
+        d3dlight l;
+        memcpy(&l, light104, sizeof l);
+        if (d->rec_sb) {
+            d->rec_sb->lights[idx] = l;
+            d->rec_sb->light_set[idx] = 1;
+            d->rec_sb->light_mask |= (u8)(1u << idx);
+            return;
+        }
+        apply_light(d, idx, &l);
+    } else {
+        hle_todo("d3d8: light index >= 8");
+    }
+}
+
+void d3d8_direct_light_enable(struct d3ddev *d, u32 idx, u32 enable)
+{
+    if (!d || idx >= MAX_LIGHTS)
+        return;
+    u8 on = enable != 0;
+    if (d->rec_sb) {
+        d->rec_sb->light_on[idx] = on;
+        d->rec_sb->light_en_mask |= (u8)(1u << idx);
+        return;
+    }
+    apply_light_enable(d, idx, on);
+}
+
+void d3d8_direct_set_texture(struct d3ddev *d, u32 stage, u32 tex_guest_ptr)
+{
+    if (!d || stage >= MAX_STAGES)
+        return;
+    if (!d->rec_sb) {
+        d3dtex *cur = d->tex[stage];
+        if (!tex_guest_ptr) {
+            if (!cur)
+                return;
+        } else if (cur && cur->obj == tex_guest_ptr) {
+            return;
+        }
+    }
+    d3dtex *t = d3d8_tex_from(tex_guest_ptr);
+    if (d->rec_sb) {
+        sb_set_tex(d->rec_sb, stage, t);
+        return;
+    }
+    apply_tex(d, stage, t);
+}
+
+void d3d8_direct_set_stream(struct d3ddev *d, u32 idx, u32 vb_guest_ptr, u32 stride)
+{
+    if (!d || idx >= MAX_STREAMS)
+        return;
+    if (!d->rec_sb) {
+        d3dbuf *cur = d->stream[idx];
+        int same = vb_guest_ptr ? (cur && cur->obj == vb_guest_ptr) : !cur;
+        if (same && d->stride[idx] == stride)
+            return;
+    }
+    d3dbuf *b = d3d8_buf_from(vb_guest_ptr);
+    if (d->rec_sb) {
+        sb_set_stream(d->rec_sb, idx, b, stride);
+        return;
+    }
+    apply_stream(d, idx, b, stride);
+}
+
+void d3d8_direct_set_indices(struct d3ddev *d, u32 ib_guest_ptr, u32 base_vertex)
+{
+    if (!d)
+        return;
+    if (!d->rec_sb) {
+        d3dbuf *cur = d->indices;
+        int same = ib_guest_ptr ? (cur && cur->obj == ib_guest_ptr) : !cur;
+        if (same && d->base_vertex == base_vertex)
+            return;
+    }
+    d3dbuf *b = d3d8_buf_from(ib_guest_ptr);
+    if (d->rec_sb) {
+        sb_set_indices(d->rec_sb, b, base_vertex);
+        return;
+    }
+    apply_indices(d, b, base_vertex);
+}
+
+void d3d8_direct_set_vs(struct d3ddev *d, u32 handle)
+{
+    if (!d)
+        return;
+    if (d->rec_sb) {
+        d->rec_sb->vs = handle;
+        d->rec_sb->has_vs = 1;
+        return;
+    }
+    apply_vs(d, handle);
+}
+
+void d3d8_direct_set_ps(struct d3ddev *d, u32 handle)
+{
+    if (!d)
+        return;
+    if (d->rec_sb) {
+        d->rec_sb->ps = handle;
+        d->rec_sb->has_ps = 1;
+        return;
+    }
+    apply_ps(d, handle);
+}
+
+void d3d8_direct_set_vs_const(struct d3ddev *d, u32 reg, const float *data, u32 count)
+{
+    if (!d || !data || !count || reg >= 96)
+        return;
+    if (reg + count > 96)
+        count = 96 - reg;
+    if (d->rec_sb) {
+        for (u32 i = 0; i < count; i++) {
+            u32 r = reg + i;
+            memcpy(d->rec_sb->vsc[r], (const u8 *)data + 16u * i, 16);
+            d->rec_sb->vsc_mask[r >> 5] |= 1u << (r & 31);
+        }
+        return;
+    }
+    memcpy(d->vsc[reg], data, (size_t)count * 16u);
+}
+
+void d3d8_direct_set_ps_const(struct d3ddev *d, u32 reg, const float *data, u32 count)
+{
+    if (!d || !data || !count || reg >= 8)
+        return;
+    if (reg + count > 8)
+        count = 8 - reg;
+    if (d->rec_sb) {
+        for (u32 i = 0; i < count; i++) {
+            u32 r = reg + i;
+            memcpy(d->rec_sb->psc[r], (const u8 *)data + 16u * i, 16);
+            d->rec_sb->psc_mask |= (u8)(1u << r);
+        }
+        return;
+    }
+    apply_psc(d, reg, count, data);
+}
+
+void d3d8_direct_set_viewport(struct d3ddev *d, const void *vp24)
+{
+    if (!d || !vp24)
+        return;
+    u32 vp[4];
+    float vpz[2];
+    memcpy(vp, vp24, 16);
+    memcpy(vpz, (const u8 *)vp24 + 16, 8);
+    if (d->rec_sb) {
+        memcpy(d->rec_sb->vp, vp, sizeof vp);
+        memcpy(d->rec_sb->vpz, vpz, sizeof vpz);
+        d->rec_sb->has_vp = 1;
+        return;
+    }
+    apply_vp(d, vp, vpz);
+}
+
+void d3d8_direct_set_clip_plane(struct d3ddev *d, u32 idx, const float *plane4)
+{
+    if (!d || !plane4 || idx >= 6)
+        return;
+    float plane[4];
+    memcpy(plane, plane4, 16);
+    if (d->rec_sb) {
+        memcpy(d->rec_sb->clip[idx], plane, 16);
+        d->rec_sb->clip_mask |= (u8)(1u << idx);
+        return;
+    }
+    apply_clip(d, idx, plane);
+}
+
+int d3d8_direct_shadow_blur(struct d3ddev *d, u32 src_tex_guest, u32 dst_surf_guest, float step_px)
+{
+    if (!d || d->rec_sb || !src_tex_guest || !(step_px >= 0.0f))
+        return 0;
+    d3dtex *src_tex = d3d8_tex_from(src_tex_guest);
+    d3dsurf *src_surf = src_tex ? NULL : d3d8_surf_from(src_tex_guest);
+    if (!src_tex && !src_surf)
+        return 0;
+    if (src_tex && src_tex->cube)
+        return 0;
+    if (src_surf && src_surf->tex) {
+        src_tex = src_surf->tex;
+        src_surf = NULL;
+    }
+    d3dsurf *dst_surf = NULL;
+    if (!dst_surf_guest) {
+        dst_surf = d->rt;
+    } else {
+        dst_surf = d3d8_surf_from(dst_surf_guest);
+        if (!dst_surf) {
+            d3dtex *dt = d3d8_tex_from(dst_surf_guest);
+            if (dt && !dt->cube && dt->surf)
+                dst_surf = dt->surf[0];
+        }
+    }
+    if (!dst_surf || !dst_surf->w || !dst_surf->h)
+        return 0;
+    if (src_tex && dst_surf->tex == src_tex)
+        return 0;
+    if (src_surf && src_surf == dst_surf)
+        return 0;
+    if (src_surf && !(src_surf->usage & USAGE_RENDERTARGET) && !src_surf->backbuffer)
+        return 0;
+    if (!dst_surf->tex && !(dst_surf->usage & USAGE_RENDERTARGET) && !dst_surf->backbuffer)
+        return 0;
+    d->draws++;
+    d3d8_cmd_shadow_blur(d, src_tex, src_surf, dst_surf, step_px);
+    return 1;
+}
+
+static void dev_SetTransform(CPU *c)
+{
+    d3d8_direct_set_transform(DEV(c), ARG(1), (const float *)(g_mem + ARG(2)));
     RET(3, D3D_OK);
 }
 
@@ -1115,25 +1381,7 @@ static void dev_MultiplyTransform(CPU *c)
 // D3DVIEWPORT8: X, Y, Width, Height, MinZ, MaxZ
 static void dev_SetViewport(CPU *c)
 {
-    d3ddev *d = DEV(c);
-    u32 vp[4];
-    float vpz[2];
-    for (int i = 0; i < 4; i++)
-        vp[i] = rd32(g_mem, ARG(1) + 4u * (u32)i);
-    vpz[0] = rdf(ARG(1) + 16);
-    vpz[1] = rdf(ARG(1) + 20);
-    if (d->rec_sb) {
-        memcpy(d->rec_sb->vp, vp, sizeof vp);
-        memcpy(d->rec_sb->vpz, vpz, sizeof vpz);
-        d->rec_sb->has_vp = 1;
-        RET(2, D3D_OK);
-    }
-    memcpy(d->vp, vp, sizeof vp);
-    memcpy(d->vpz, vpz, sizeof vpz);
-    if (d3d8_dumping(d))
-        fprintf(stderr, "[dump] SetViewport %u,%u %ux%u\n", d->vp[0], d->vp[1], d->vp[2], d->vp[3]);
-    d->gen_vp++;
-    d->gl_dirty |= GLD_VP;
+    d3d8_direct_set_viewport(DEV(c), g_mem + ARG(1));
     RET(2, D3D_OK);
 }
 
@@ -1149,14 +1397,7 @@ static void dev_GetViewport(CPU *c)
 
 static void dev_SetMaterial(CPU *c)
 {
-    d3ddev *d = DEV(c);
-    if (d->rec_sb) {
-        memcpy(d->rec_sb->material, g_mem + ARG(1), sizeof d->rec_sb->material);
-        d->rec_sb->has_mat = 1;
-        RET(2, D3D_OK);
-    }
-    memcpy(d->material, g_mem + ARG(1), sizeof d->material);
-    d->gen_mat++;
+    d3d8_direct_set_material(DEV(c), g_mem + ARG(1));
     RET(2, D3D_OK);
 }
 
@@ -1168,20 +1409,7 @@ static void dev_GetMaterial(CPU *c)
 
 static void dev_SetLight(CPU *c)
 {
-    d3ddev *d = DEV(c);
-    u32 i = ARG(1);
-    if (i < MAX_LIGHTS) {
-        if (d->rec_sb) {
-            memcpy(&d->rec_sb->lights[i], g_mem + ARG(2), sizeof(d3dlight));
-            d->rec_sb->light_set[i] = 1;
-            d->rec_sb->light_mask |= (u8)(1u << i);
-            RET(3, D3D_OK);
-        }
-        memcpy(&d->lights[i], g_mem + ARG(2), sizeof(d3dlight));
-        d->light_set[i] = 1;
-        d->gen_light++;
-    } else
-        hle_todo("d3d8: light index >= 8");
+    d3d8_direct_set_light(DEV(c), ARG(1), g_mem + ARG(2));
     RET(3, D3D_OK);
 }
 
@@ -1196,24 +1424,7 @@ static void dev_GetLight(CPU *c)
 
 static void dev_LightEnable(CPU *c)
 {
-    d3ddev *d = DEV(c);
-    u32 i = ARG(1);
-    if (i < MAX_LIGHTS) {
-        if (d->rec_sb) {
-            d->rec_sb->light_on[i] = ARG(2) != 0;
-            d->rec_sb->light_en_mask |= (u8)(1u << i);
-            RET(3, D3D_OK);
-        }
-        if (!d->light_set[i]) {  // как D3D: включение незаданного источника — белый направленный (0,0,1)
-            memset(&d->lights[i], 0, sizeof(d3dlight));
-            d->lights[i].type = 3;
-            d->lights[i].diffuse[0] = d->lights[i].diffuse[1] = d->lights[i].diffuse[2] = 1.0f;
-            d->lights[i].dir[2] = 1.0f;
-            d->light_set[i] = 1;
-        }
-        d->light_on[i] = ARG(2) != 0;
-        d->gen_light++;
-    }
+    d3d8_direct_light_enable(DEV(c), ARG(1), ARG(2));
     RET(3, D3D_OK);
 }
 
@@ -1226,17 +1437,7 @@ static void dev_GetLightEnable(CPU *c)
 
 static void dev_SetClipPlane(CPU *c)
 {
-    d3ddev *d = DEV(c);
-    u32 i = ARG(1);
-    if (i < 6) {
-        if (d->rec_sb) {
-            memcpy(d->rec_sb->clip[i], g_mem + ARG(2), 16);
-            d->rec_sb->clip_mask |= (u8)(1u << i);
-            RET(3, D3D_OK);
-        }
-        memcpy(d->clip[i], g_mem + ARG(2), 16);
-        d->gen_clip++;
-    }
+    d3d8_direct_set_clip_plane(DEV(c), ARG(1), (const float *)(g_mem + ARG(2)));
     RET(3, D3D_OK);
 }
 
@@ -1250,16 +1451,7 @@ static void dev_GetClipPlane(CPU *c)
 
 static void dev_SetRenderState(CPU *c)
 {
-    d3ddev *d = DEV(c);
-    u32 st = ARG(1), val = ARG(2);
-    if (d->rec_sb) {
-        if (st < 256) {
-            d->rec_sb->rs[st] = val;
-            sb_set_rs_bit(d->rec_sb, st);
-        }
-        RET(3, D3D_OK);
-    }
-    apply_rs(d, st, val);
+    d3d8_direct_set_rs(DEV(c), ARG(1), ARG(2));
     RET(3, D3D_OK);
 }
 
@@ -1371,16 +1563,7 @@ static void dev_GetTexture(CPU *c)
 
 static void dev_SetTexture(CPU *c)
 {
-    d3ddev *d = DEV(c);
-    u32 s = ARG(1);
-    if (s >= MAX_STAGES)
-        RET(3, D3D_OK);
-    d3dtex *t = d3d8_tex_from(ARG(2));
-    if (d->rec_sb) {
-        sb_set_tex(d->rec_sb, s, t);
-        RET(3, D3D_OK);
-    }
-    apply_tex(d, s, t);
+    d3d8_direct_set_texture(DEV(c), ARG(1), ARG(2));
     RET(3, D3D_OK);
 }
 
@@ -1393,16 +1576,7 @@ static void dev_GetTextureStageState(CPU *c)
 
 static void dev_SetTextureStageState(CPU *c)
 {
-    d3ddev *d = DEV(c);
-    u32 s = ARG(1), t = ARG(2), val = ARG(3);
-    if (d->rec_sb) {
-        if (s < MAX_STAGES && t < 32) {
-            d->rec_sb->tss[s][t] = val;
-            d->rec_sb->tss_mask[s] |= 1u << t;
-        }
-        RET(4, D3D_OK);
-    }
-    apply_tss(d, s, t, val);
+    d3d8_direct_set_tss(DEV(c), ARG(1), ARG(2), ARG(3));
     RET(4, D3D_OK);
 }
 
@@ -1419,26 +1593,42 @@ static void dev_SetCurrentTexturePalette(CPU *c) { RET(2, D3D_OK); }
 // ---------------------------------------------------------------- отрисовка
 static void dev_DrawPrimitive(CPU *c)  // (Type, StartVertex, PrimitiveCount)
 {
-    d3d8_draw(DEV(c), ARG(1), ARG(3), 0, ARG(2), 0, 0, NULL, 0, NULL, 0);
+    d3ddev *d = DEV(c);
+    u32 count = ARG(3);
+    if (count) {
+        d->draws++;
+        d3d8_cmd_draw(d, ARG(1), count, 0, ARG(2), 0, 0);
+    }
     RET(4, D3D_OK);
 }
 
 static void dev_DrawIndexedPrimitive(CPU *c)  // (Type, MinIndex, NumVertices, StartIndex, PrimCount)
 {
-    d3d8_draw(DEV(c), ARG(1), ARG(5), 1, ARG(4), ARG(2), ARG(3), NULL, 0, NULL, 0);
+    d3ddev *d = DEV(c);
+    u32 count = ARG(5);
+    if (count) {
+        d->draws++;
+        d3d8_cmd_draw(d, ARG(1), count, 1, ARG(4), ARG(2), ARG(3));
+    }
     RET(6, D3D_OK);
 }
 
 static void dev_DrawPrimitiveUP(CPU *c)  // (Type, PrimitiveCount, pVertexStreamZeroData, Stride)
 {
     d3ddev *d = DEV(c);
-    d3d8_draw(d, ARG(1), ARG(2), 0, 0, 0, 0, g_mem + ARG(3), ARG(4), NULL, 0);
-    // как D3D: после *UP поток 0 и индексы сброшены
+    u32 count = ARG(2);
+    if (count) {
+        d->draws++;
+        d3d8_cmd_draw_up(d, ARG(1), count, 0, 0, 0, g_mem + ARG(3), ARG(4), NULL, 0);
+    }
+    // как D3D: после *UP поток 0 сброшен (Core 2 сбрасывает d->r.stream[0] внутри x_draw_up)
     if (d->stream[0]) {
         com_release(d->stream[0]->obj);
         d->stream[0] = NULL;
     }
     d->stride[0] = 0;
+    if (!count)
+        d3d8_cmd_stream(d, 0, NULL, 0);
     RET(5, D3D_OK);
 }
 
@@ -1446,7 +1636,11 @@ static void dev_DrawPrimitiveUP(CPU *c)  // (Type, PrimitiveCount, pVertexStream
 static void dev_DrawIndexedPrimitiveUP(CPU *c)
 {
     d3ddev *d = DEV(c);
-    d3d8_draw(d, ARG(1), ARG(4), 1, 0, ARG(2), ARG(3), g_mem + ARG(7), ARG(8), g_mem + ARG(5), ARG(6));
+    u32 count = ARG(4);
+    if (count) {
+        d->draws++;
+        d3d8_cmd_draw_up(d, ARG(1), count, 1, ARG(2), ARG(3), g_mem + ARG(7), ARG(8), g_mem + ARG(5), ARG(6));
+    }
     if (d->stream[0]) {
         com_release(d->stream[0]->obj);
         d->stream[0] = NULL;
@@ -1456,6 +1650,10 @@ static void dev_DrawIndexedPrimitiveUP(CPU *c)
         d->indices = NULL;
     }
     d->stride[0] = 0;
+    if (!count) {
+        d3d8_cmd_stream(d, 0, NULL, 0);
+        d3d8_cmd_indices(d, NULL, d->base_vertex);
+    }
     RET(9, D3D_OK);
 }
 
@@ -1478,6 +1676,7 @@ static void dev_CreateVertexShader(CPU *c)
             g_vs[i].ntok = parse_decl(d, ARG(1), &g_vs[i].decl);
             g_vs[i].tokens = malloc(4 * g_vs[i].ntok);
             memcpy(g_vs[i].tokens, g_mem + ARG(1), 4 * g_vs[i].ntok);
+            d3d8_cmd_vs_set(i, &g_vs[i].decl);
             wr32(g_mem, ARG(3), VS_HANDLE_BASE + i);
             RET(5, D3D_OK);
         }
@@ -1486,13 +1685,7 @@ static void dev_CreateVertexShader(CPU *c)
 
 static void dev_SetVertexShader(CPU *c)
 {
-    d3ddev *d = DEV(c);
-    if (d->rec_sb) {
-        d->rec_sb->vs = ARG(1);
-        d->rec_sb->has_vs = 1;
-        RET(2, D3D_OK);
-    }
-    d->vs = ARG(1);  // влияет только на vdecl / ffkey
+    d3d8_direct_set_vs(DEV(c), ARG(1));
     RET(2, D3D_OK);
 }
 
@@ -1508,23 +1701,14 @@ static void dev_DeleteVertexShader(CPU *c)
     if (ARG(1) >= VS_HANDLE_BASE && i < MAX_VS && g_vs[i].used) {
         free(g_vs[i].tokens);
         memset(&g_vs[i], 0, sizeof g_vs[i]);
+        d3d8_cmd_vs_del(i);
     }
     RET(2, D3D_OK);
 }
 
 static void dev_SetVertexShaderConstant(CPU *c)  // (Register, pConstantData, ConstantCount)
 {
-    d3ddev *d = DEV(c);
-    if (d->rec_sb) {
-        for (u32 i = 0; i < ARG(3) && ARG(1) + i < 96; i++) {
-            u32 r = ARG(1) + i;
-            memcpy(d->rec_sb->vsc[r], g_mem + ARG(2) + 16 * i, 16);
-            d->rec_sb->vsc_mask[r >> 5] |= 1u << (r & 31);
-        }
-        RET(4, D3D_OK);
-    }
-    for (u32 i = 0; i < ARG(3) && ARG(1) + i < 96; i++)
-        memcpy(d->vsc[ARG(1) + i], g_mem + ARG(2) + 16 * i, 16);
+    d3d8_direct_set_vs_const(DEV(c), ARG(1), (const float *)(g_mem + ARG(2)), ARG(3));
     RET(4, D3D_OK);
 }
 
@@ -1538,16 +1722,10 @@ static void dev_GetVertexShaderConstant(CPU *c)
 
 static void dev_SetStreamSource(CPU *c)  // (StreamNumber, pStreamData, Stride)
 {
-    d3ddev *d = DEV(c);
     u32 n = ARG(1);
     if (n >= MAX_STREAMS)
         RET(4, D3DERR_INVALIDCALL);
-    d3dbuf *b = d3d8_buf_from(ARG(2));
-    if (d->rec_sb) {
-        sb_set_stream(d->rec_sb, n, b, ARG(3));
-        RET(4, D3D_OK);
-    }
-    apply_stream(d, n, b, ARG(3));
+    d3d8_direct_set_stream(DEV(c), n, ARG(2), ARG(3));
     RET(4, D3D_OK);
 }
 
@@ -1565,13 +1743,7 @@ static void dev_GetStreamSource(CPU *c)
 
 static void dev_SetIndices(CPU *c)  // (pIndexData, BaseVertexIndex)
 {
-    d3ddev *d = DEV(c);
-    d3dbuf *b = d3d8_buf_from(ARG(1));
-    if (d->rec_sb) {
-        sb_set_indices(d->rec_sb, b, ARG(2));
-        RET(3, D3D_OK);
-    }
-    apply_indices(d, b, ARG(2));
+    d3d8_direct_set_indices(DEV(c), ARG(1), ARG(2));
     RET(3, D3D_OK);
 }
 
@@ -1594,13 +1766,7 @@ static void dev_CreatePixelShader(CPU *c)  // (pFunction, pHandle)
 
 static void dev_SetPixelShader(CPU *c)
 {
-    d3ddev *d = DEV(c);
-    if (d->rec_sb) {
-        d->rec_sb->ps = ARG(1);
-        d->rec_sb->has_ps = 1;
-        RET(2, D3D_OK);
-    }
-    d->ps = ARG(1);  // влияет только на ffkey
+    d3d8_direct_set_ps(DEV(c), ARG(1));
     RET(2, D3D_OK);
 }
 
@@ -1618,18 +1784,7 @@ static void dev_DeletePixelShader(CPU *c)
 
 static void dev_SetPixelShaderConstant(CPU *c)  // (Register, pConstantData, ConstantCount)
 {
-    d3ddev *d = DEV(c);
-    if (d->rec_sb) {
-        for (u32 i = 0; i < ARG(3) && ARG(1) + i < 8; i++) {
-            u32 r = ARG(1) + i;
-            memcpy(d->rec_sb->psc[r], g_mem + ARG(2) + 16 * i, 16);
-            d->rec_sb->psc_mask |= (u8)(1u << r);
-        }
-        RET(4, D3D_OK);
-    }
-    for (u32 i = 0; i < ARG(3) && ARG(1) + i < 8; i++)
-        memcpy(d->psc[ARG(1) + i], g_mem + ARG(2) + 16 * i, 16);
-    d->gen_psc++;
+    d3d8_direct_set_ps_const(DEV(c), ARG(1), (const float *)(g_mem + ARG(2)), ARG(3));
     RET(4, D3D_OK);
 }
 
@@ -1650,6 +1805,7 @@ static void dev_destroy(void *p)
     d3ddev *d = p;
     d->obj = 0;
     sb_destroy_all(d);
+    d3d8_cmd_unbind_all(d);
     for (int s = 0; s < MAX_STAGES; s++)
         if (d->tex[s]) {
             com_release(d->tex[s]->obj);
@@ -1664,7 +1820,6 @@ static void dev_destroy(void *p)
         com_release(d->indices->obj);
         d->indices = NULL;
     }
-    d->gl_dirty = GLD_ALL;
 }
 
 static void init_vtable(void)
@@ -1852,7 +2007,7 @@ u32 d3d8_device_create(CPU *c, u32 hwnd, u32 pp)
         if (d->obj)
             com_addref(d->obj);  // старое ещё не освобождено — то же устройство
         else {
-            d->obj = com_create(g_vt_dev, d, dev_destroy);
+            d->obj = com_create_st(g_vt_dev, d, dev_destroy);
             d3d8_res_init(d->obj);
         }
         d->hwnd = hwnd;
@@ -1867,23 +2022,18 @@ u32 d3d8_device_create(CPU *c, u32 hwnd, u32 pp)
         free(d);
         return 0;
     }
-    d->obj = com_create(g_vt_dev, d, dev_destroy);
+    d->obj = com_create_st(g_vt_dev, d, dev_destroy);
     g_dev = d;
     for (u32 ch = 0; ch < 3; ch++)
         for (u32 i = 0; i < 256; i++)
             d->gamma[ch][i] = (u16)(i * 257u);
     d->gamma_dirty = 1;
     d3d8_res_init(d->obj);
-    glGenVertexArrays(1, &d->vao);
-    glBindVertexArray(d->vao);
-    glGenBuffers(1, &d->up_vbo);
-    glGenBuffers(1, &d->up_ibo);
-    glGenSamplers(MAX_STAGES, d->samplers);
-    d3d8_caps_probe(d);
+    d3d8_cmd_init_gl(d);
     d3d8_prog_preload();
     make_backbuffer(d);
     set_defaults(d);
-    d3d8_bind_target(d);
+    d3d8_cmd_set_rt(d, d->rt, d->ds, 1);
     return d->obj;
 }
 

@@ -2,6 +2,7 @@
 // Подкачки по требованию у Horizon нет — память занята сразу, поэтому нужен полный режим (запуск через игру
 // с зажатой R, ~3,2 ГБ); в applet-режиме (~400 МБ) блок не выделится. Первые 64 КБ гостя (NULL и окрестности)
 // закрываются, если ядро позволяет; адреса за окном не охраняются (на маке — резерв 4 ГБ).
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,7 @@
 #include <switch.h>
 #include <sys/iosupport.h>
 
+#include "platform/platform.h"
 #include "runtime/rt.h"
 
 static int is_full_mode(void)
@@ -122,4 +124,53 @@ void rt_platform_thread_core(int core)
     Result r = svcSetThreadCoreMask(threadGetCurHandle(), core, 1u << core);
     if (R_FAILED(r))
         fprintf(stderr, "[mem] svcSetThreadCoreMask(core %d) failed: %#x\n", core, r);
+}
+
+void rt_platform_thread_background(void)
+{
+    rt_platform_thread_core(0);
+    // Приоритет ниже стандартного (0x2C = 44; большее число — ниже приоритет, 0x34 = 52)
+    Result r = svcSetThreadPriority(threadGetCurHandle(), 0x34);
+    if (R_FAILED(r))
+        fprintf(stderr, "[mem] svcSetThreadPriority(0x34) failed: %#x\n", r);
+}
+
+static pthread_mutex_t g_boost_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_boost_refs;
+
+void rt_platform_cpu_boost(int on)
+{
+    if (!is_full_mode())
+        return;
+    pthread_mutex_lock(&g_boost_lock);
+    if (on) {
+        if (g_boost_refs++ == 0) {
+            Result r = appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+            if (R_FAILED(r))
+                fprintf(stderr, "[mem] appletSetCpuBoostMode(FastLoad) failed: %#x\n", r);
+        }
+    } else if (g_boost_refs > 0) {
+        if (--g_boost_refs == 0) {
+            Result r = appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+            if (R_FAILED(r))
+                fprintf(stderr, "[mem] appletSetCpuBoostMode(Normal) failed: %#x\n", r);
+        }
+    }
+    pthread_mutex_unlock(&g_boost_lock);
+}
+
+void rt_platform_cpu_boost_reset(void)
+{
+    if (!is_full_mode())
+        return;
+    // При аварийном выходе (on_trap) не ждём мьютекс, чтобы не зависнуть на чужой блокировке
+    if (pthread_mutex_trylock(&g_boost_lock) == 0) {
+        int was = g_boost_refs;
+        g_boost_refs = 0;
+        if (was > 0)
+            appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+        pthread_mutex_unlock(&g_boost_lock);
+    } else {
+        appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+    }
 }

@@ -243,7 +243,7 @@ cmake -S . -B build/mac-rel -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSNX_TRA
 
 * `--seconds N` сбрасывает лог движка и выходит с кодом 0 — используй для коротких прогонов. Headless — копия
   пользовательского каталога с `RenderDevice=Engine.NullRenderDevice` и `--headless` (или `tools/test_maps.py --headless`).
-* Генерация: `SNX_INLINE_MAX`, `SNX_REGS=0`, `SNX_REGCHECK=1`, `SNX_FPU_SINGLE=1` (округление арифметики x87 и `fsqrt` к `float`). CMake: `SNX_TRACE` (в `build/mac` включён, ≈−35 % скорости), `SNX_SANITIZE` (`address;undefined`), `SNX_PIN` (Switch и Linux ARM64 GCC), `SNX_PGO=gen|use`, `SNX_PGO_DIR`, `SNX_SECTION_ORDER`, `SNX_VARIANT=rus`.
+* Генерация: `SNX_INLINE_MAX`, `SNX_REGS=0`, `SNX_REGCHECK=1`, `SNX_FPU_FLOAT32=1` (нативные `float f0..f7` в чистых f32-функциях, по умолчанию `0`), `SNX_FPU_SINGLE=1` (округление арифметики x87 и `fsqrt` к `float`). CMake: `SNX_TRACE` (в `build/mac` включён, ≈−35 % скорости), `SNX_SANITIZE` (`address;undefined`), `SNX_PIN` (Switch и Linux ARM64 GCC), `SNX_PGO=gen|use`, `SNX_PGO_DIR`, `SNX_SECTION_ORDER`, `SNX_VARIANT=rus`.
 * Ограничение времени на маке: `perl -e "alarm 120; exec @ARGV" ...` (`timeout` нет).
 
 ### Дифф-тесты
@@ -273,7 +273,8 @@ tools/build.sh mac difftest_msvcr70 && UC_IGNORE_REG_BREAK=1 tools/.venv/bin/pyt
 | `SNX_SHOT=300,600`, `SNX_SHOT_DIR`, `SNX_DUMP_DRAWS=<кадр>` | PNG итогового кадра после Present (4:3, гамма, оверлей); состояние каждой отрисовки (`tools/probe/sheet.py`) |
 | `SNX_EH_TEST=<с>`, `SNX_ERR_TEST=<с>` | исключение C++ в `StaticLoadObject`; фатальная ошибка движка |
 | `SNX_CFG_TEST=<с>[,<n>[,<мс>]]`, `SNX_CFG_CHECK=1` | n подборов монеты бонусного уровня (`bonuscoins`+1 и `SaveConfig` контроллера героя) с паузой (250 мс; 0 — подряд в одном кадре, тогда каждый ждёт запись `User.ini` предыдущего), время — `[core] SaveConfig`; сверка пропусков перечитывания и `GetString` с оригиналом |
-| `SNX_AR_CHECK=1` | сверка быстрого пути `ovr_launch_file_read` (`FArchiveFileReader::Serialize`) с оригиналом |
+| `SNX_AR_CHECK=1`, `SNX_MATH_CHECK=1`, `SNX_QSORT_CHECK=1`, `SNX_SKIN_CHECK=1`, `SNX_PARTICLE_CHECK=1`, `SNX_D3D_COMMIT_CHECK=1` | сверка быстрых оверрайдов (`FArchiveFileReader::Serialize`, `BoxCheck`/`SphereCheck`/`Core` math, `qsort`, `MeshSkinVerts`, `USpriteEmitter::FillVertexBuffer`, `D3DDrv` `CommitState`/`SetMaterialPass`) с оригиналом |
+| `SNX_GPU_SHADOW_BLUR=0` | отключить 1-проходное GPU-размытие теней-проекторов (откат на 9 `DrawTile`) для A/B сверки |
 | `SNX_FIELD_CHECK=1` | сверить кеш обхода свойств с полным обходом |
 | `SNX_PERF=1`, `SNX_NOVSYNC=1`, `SNX_PROF=<файл>`, `SNX_CALLSTATS=<файл>` | инструкции и такты на кадр; без vsync; профиль; счётчики входов |
 | `SNX_RENDER_THREAD=0`, `SNX_GLTHREAD=1`, `SNX_FILE_CACHE_MB` | без потока рендера; glthread Mesa; бюджет образов пакетов |
@@ -317,42 +318,77 @@ PGO: `tools/build.sh switch-pgo` → прогон с `--pgo-dump` → `python3 -
 
 ---
 
-## Состояние (0.1.0 + ветка `perf/recomp`)
+## Состояние (0.3.0)
 
-Игра играется на Switch (0.1.0): меню, первый уровень, катсцены, магазин, звук, ролики, геймпад, сохранения; обе
-локализации. Все импорты реализованы; дифф-тесты без необъяснённых расхождений. На ветке `perf/recomp`
-объединены доработки инфраструктуры/CI/тестов, slab-аллокатор и потоковый Bink+NEON, консольный UI (кириллица,
-легенда, Quick Menu, вибрация, `swkbd`), системные хуки Switch/POSIX и паузируемые часы, гранулярный D3D8 +
-гамма-LUT + 4:3-меню + `CopyRects`/`UpdateTexture`/`GetFrontBuffer`/`StateBlocks` + кеш `ps.1.x`/бинарников GL,
-а также `recomp check`, параллельный `gen` и нативный `FArchiveFileReader::Serialize`.
+Игра играется на Switch (0.3.0): меню, уровни (`1_Shreks_Swamp`, `3_The_Hunt_Part4`), катсцены, магазин, звук,
+ролики, геймпад, вибрация, сохранения; обе локализации. Все импорты реализованы; дифф-тесты без необъяснённых
+расхождений. В релизе **0.3.0** объединены Шаги 1–3 оптимизации и стабильности:
+* **D3D8-уровневый Command Stream на Core 2 + нативный `D3DDrv` + GPU-размытие теней**
+  (`runtime/hle/{gl_cs,d3d8*,com}.{c,h}`, `runtime/overrides_engine.c`, `runtime/ovr_orig_weak.c`, тесты
+  `d3d8_cs_test`/`perf_ovr_test`): перенос `d3d8_ff.c` на Core 2 под `#define GL_CS_NO_WRAP`, zero-copy слоты
+  (`DYN_SLOTS=4`) для динамических VB/IB, однопоточный COM (`com_create_st`), прямой C-интерфейс `d3d8_direct.h`
+  и нативные оверрайды `D3DDrv.dll!0x1281fe80` (`CommitState`), `0x12819eb0` (`SetMaterialPass`), `0x12802100`
+  (`ehvec_ctor`), 1-проходное GPU-размытие теней `UShadowBitmapMaterial::Get` (`Engine.dll!0x121e0050`),
+  вынос 13 слабых `ovr_orig_*` в `runtime/ovr_orig_weak.c`;
+* **ядро рекомпилятора `SNX_PIN` и L1I** (`recomp/{emit,gen}.py`, `runtime/{gen_rt.h,icall_pin.c,rt.c,abi.h}`,
+  `cmake/gen.cmake`, `CMakeLists.txt`, `tools/probe/hotorder.py`, `tools/pgo_fetch.py`): закрепление `CPU *c` в
+  `x28` (`-ffixed-x28`), инлайн `RT_RDTSC()` (`mrs cntpct_el0`) на Switch, слияние x87-сравнений,
+  `SNX_FPU_FLOAT32=1`, компактный `RT_ICALL` + `pin_wrap_000..3ff → rt_pin_call_native` + `rt_gnatives_cache[4096]`,
+  единый `rt_icall_slow`, компактная `RT_IC2` (32 КБ), `-fno-math-errno`, `SNX_NO_JT`, инлайнинг `REP_MOVS`/`REP_STOS`,
+  раздельный `hot_order.ld` Core 1 / Core 2 с поддержкой клонов GCC (`.part`/`.constprop`/`.isra`);
+* **нативные C/NEON-оверрайды, `FastLoad` и фиксы I/O** (`runtime/overrides_{engine,crt,core}.c`,
+  `platform/{platform.h,switch/mem.c}`, `runtime/hle/kernel32_file.c`, `host/boot/prof.c`, `runtime/game/rumble.c`,
+  тест `wfile_test`): NEON `BoxCheck`/`SphereCheck`, `MeshSkinVerts`, `USpriteEmitter::FillVertexBuffer`, нативный
+  `msvcr70!qsort` (fast16 introsort), листья `Core.dll`, `FastLoad` CPU boost вокруг `SaveGame`, фикс гонки
+  `hle_kernel32_WriteFile`, `FIMG_MAX=128 МБ` (`AllDialog.uax` в RAM), кеш оверлейных `.int`/`.rus`, буфер
+  `setvbuf` 256 КБ в `prof.c`, оптимизация `rumble.c`.
 
-**Проверено на macOS arm64:** CTest 11/11 (включая ASan+UBSan), `tests/test_recomp.py` 20/20, `recomp check`
-(12/12, 56/56, 5/5), перегенерация 12 модулей, живые прогоны `Book_FrontEnd.unr` (4:3 pillarbox, легенда кнопок,
-Quick Menu), `1_Shreks_Swamp.unr` (в т. ч. `SNX_AR_CHECK=1`: 0 расхождений) и `3_The_Hunt_Part4.unr` (проходит
-оба исключения C++, 0 `TRAP`/`TODO`/`GL error`; `[abi]` на `Core.dll!0x10167ba1` из `_CallSettingFrame`
-`msvcr70.dll!0x13007a2f` — штатный не-ABI вызов `catch`-функлета, где `_CallSettingFrame` сам сохраняет `esi/edi`).
-**Switch и Linux:** сборка/запуск на реальном железе Switch (хуки HOME/сон/док/applet, `swkbd`, бинарный кеш GL,
-новые замеры FPS) и на реальном Linux (`linux-arm64` CI) — `[проверить]`.
+**Проверено на macOS arm64:**
+* `recomp check` 12/12 модулей и **70/70** оверрайдов на `en` и `rus`; `tests/test_recomp.py` **24/24**;
+  `tests/test_public.py` 3/3 и `tools/check_public.py` (0 проблем);
+* `build/mac` и `build/mac-san` (ASan+UBSan): **14/14 CTest** (включая `wfile_test`, `d3d8_cs_test`,
+  `perf_ovr_test` и чистую линковку всех 12 `difftest_*` без `snx_hle`);
+* полный `tests/difftest/run_all.sh 1500 4` (`SNX_FPU_FLOAT32=0`, 12/12 модулей): **11 265 pass, 0 регрессий**;
+* перегенерация 12 модулей (`f32=0` и `f32=1`, инвариант `&(eax|…|edi)` = 0) и живые прогоны
+  `1_Shreks_Swamp.unr` (5/5 сверок `SNX_*_CHECK=1`, A/B `SNX_GPU_SHADOW_BLUR=1/0`, `SNX_RENDER_THREAD=0`) и
+  `3_The_Hunt_Part4.unr`: **0 расхождений/ошибок**, `AllDialog.uax` и `.int` в RAM (`386 MB`).
 
-Точка отсчёта для замеров (0.1.0, Switch, болото у точки сохранения после катсцены, 1280×720, CPU 1020 МГц):
-**38,0–38,8 кадр/с с PGO, 34,2–35,3 без PGO**. Меню — 60, ролики — 45–52. Кадр сохранения — 0,77–0,79 с,
-фризы 50–200 мс от сборки программ GL — только в первом запуске. На Switch упор в поток гостя (в основном
-сгенерированный код), поток рендера простаивает.
+**Проверено на реальном Switch** (0.3.0, 1280×720, CPU 1020 МГц, полный режим памяти, `SNX_PIN=ON`, `-ffixed-x28`,
+`SNX_FPU_FLOAT32=1`, свежий PGO + `build/hot_order.ld` с клонами GCC):
+* аудит ELF: `.crt0` (`_start`) на `0x0`, **25/25 сильных `D ovr_orig_*`**, `rt_pin_enter` `0x130`,
+  `rt_icall_slow` — 1 копия `0x1a0`, `rt_pin_call_native` `0x220`, `.text` 26,32 МиБ (3 190 `.cold`-символов /
+  1,41 МиБ вынесено PGO), `mov x0,x28` в 128 КБ **689 → 6**, `bl <rt_rdtsc>` **382 → 0**;
+* профиль болота **0.3.0 с PGO** (`prof_swamp_pgo.txt`, 3 582 кадра) vs база 0.2.0 (старый PGO) / Шаг 3 (без PGO):
+  - **95,5% кадров ≤17 мс (60 FPS)** (было 39,4% на 0.2.0 / 55,2% без PGO), среднее **16,42 мс** (было 20,11),
+    медиана **16 мс** (было 21), **p90 / p95 / p99 / max: 17 / 17 / 20 / 34 мс** (p95 −8 мс), **0 хичей**;
+  - активное время Core 1: **14,34 мс/кадр (≈69,7 uncapped FPS, −24,1% к 0.2.0)**, `cs_swap` vsync wait **12,65%**;
+  - Core 2: **32,55% IDLE**, Mesa 62,15%, наш `d3d8+gl_cs` 3,02% (`x_shadow_blur` 0,35%), swap 2,27%;
+  - L1I / L2 `.text`: **`<48 КБ` 31,62%** (было 20,05%), **`<128 КБ` 58,10%**, **`<1 МБ` 96,88%**, рабочий набор
+    Core 1 **308 страниц (1,20 МБ)**, попадания в `.cold` **0,00%**;
+  - `SaveGame(0)` на болоте: **347–364 мс** (было ~655 мс), диалоговые фризы = 0;
+  - `3_The_Hunt_Part4.unr`: устранён краш автосейва, стабильные **49–53 FPS** на 7 300+ кадрах.
+* Linux (`linux-arm64` CI) — `[проверить]` на реальном Linux.
+
+Точка отсчёта 0.1.0 (Switch, болото у точки сохранения после катсцены, 1280×720, CPU 1020 МГц):
+**38,0–38,8 кадр/с с PGO, 34,2–35,3 без PGO**. Меню — 60, ролики — 45–52. Кадр сохранения — 0,77–0,79 с.
 
 **Известные расхождения дифф-тестов — не ищи в них ошибку перевода:** msvcr70 — `_inp/_outp`, SSE2-ветки, обходы
 FDIV, `fnstenv/fldenv` (не реализованы), `_j0/_j1/_jn` на краях, 117 функций математики с ошибками x87-анализа
 (заменены нативными); D3DDrv — SSE/3DNow!/MMX-ветки, определение CPU (`1282b8e5`, `1282b9db`, `12831be5`),
-`fsincos` при |x| ≥ 2^63, eax после `_CIacos` (`12829305`), мусорный указатель функции (`128298c1`); Core —
-`appLoge` от отрицательного.
+`fsincos` при |x| ≥ 2^63, eax после `_CIacos` (`12829305`), мусорный указатель функции (`128298c1`), scratch
+`eax` в `void`-обёртках `ovr_memcpy` (`D3DDrv!0x1281ed90`, `Engine!0x1204bc00`); Core — `appLoge` от
+отрицательного, scratch `eax` в `appQsort`.
 
-**Открытые задачи:**
-* Фризы: сборка программ GL на отдельном контексте (риск: контексты Mesa nouveau делят pushbuf), остаток
-  сохранения (`SavePackage`), проверка кеша бинарников `SnxProgramBins.bin` на Mesa Switch (`[проверить]`).
-* Производительность: тени-проекторы (`UShadowBitmapMaterial::Get` `Engine.dll!0x120027ed` — 8 % потока гостя),
-  диспетчер `GNatives` (`Core.dll!0x1021b780`), D3D8 в потоке рендера, старт игры. Выбирай по свежему профилю
-  на Switch.
+**Открытые задачи (после 0.3.0):**
+* **Топ-5 оставшихся функций Core 1 на Switch (резерв для тяжёлых сцен / p99):**
+  1. `Engine.dll!0x121a3f90` (сортировка/подготовка StaticMesh и актёров — 3,47% self / 0,57 мс/кадр);
+  2. `Engine.dll!0x121bba30` (обход видимых актёров сцены — 2,91% self / 0,48 мс/кадр, 6,73% incl);
+  3. `Engine.dll!0x12166040 (UParticleEmitter::UpdateParticles)` (2,77% self / 0,46 мс/кадр, 5,05% incl);
+  4. `Engine.dll!0x121bdfe0` (ядро `FLevelSceneNode::Render` — 1,96% self / 52,68% incl);
+  5. `Engine.dll!0x121af780` (освещение/подготовка мешей — 1,94% self / 0,32 мс/кадр).
+* **Фризы:** остаток сохранения (`SavePackage`, ~347–364 мс), проверка `SnxProgramBins.bin` на Mesa Switch (`[проверить]`).
 * 2D HUD во время игры по-прежнему растянут в 16:9 (для страниц меню есть опциональный 4:3-pillarbox с 4:3-проекцией камеры, по умолчанию выключен).
 * Кооперативная остановка фоновых потоков `kernel32_file.c` и `CreateThread` (чтобы отказаться от `svcExitProcess`),
   смена разрешения буфера (`setres`) при `OnOperationMode` (док ↔ портатив).
 * Не проверены на железе Switch: загрузка сейвов, переходы между уровнями, окно фатальной ошибки,
-  HOME/сон/док/applet-диалог/экранная клавиатура (`docs/CONSOLE.md`), визуальная сверка с ПК и Linux-сборка.
+  HOME/сон/док/экранная клавиатура (`docs/CONSOLE.md`), визуальная сверка с ПК и Linux-сборка.

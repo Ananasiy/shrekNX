@@ -4,9 +4,13 @@
 // и пост-проходом Present (переворот по Y, пропорции / 4:3-pillarbox меню, гамма-LUT 256x1 RGB16).
 // Матрицы D3D (строки, вектор-строка) загружаются в GL как есть: GL читает их по столбцам, получается
 // транспонированная — ровно то, что нужно для M * v.
+// Все вызовы GL в этом файле выполняются исключительно на потоке рендера (Core 2, либо Core 1 в direct-режиме),
+// поэтому макросы cs_gl* здесь отключены (GL_CS_NO_WRAP).
+#define GL_CS_NO_WRAP
 #include <math.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #ifdef __APPLE__
@@ -66,57 +70,33 @@ static void compute_normal_mat(float nm[9], const float wv[16])
     }
 }
 
-typedef struct {
-    GLint loc;
-    float m[9];
-} u_mat3_arg;
+// ================================================================ цели рендера (Core 2)
+static void dump_target_r(d3d_rstate *r);
+static int dumping_frame(int frame);
 
-static void x_uniform_mat3(void *arg)
+static void bind_target_r(d3d_rstate *r)
 {
-    const u_mat3_arg *a = arg;
-    glUniformMatrix3fv(a->loc, 1, GL_FALSE, a->m);
-}
-
-static void upload_mat3(GLint loc, const float m[9])
-{
-    u_mat3_arg a;
-    a.loc = loc;
-    memcpy(a.m, m, sizeof a.m);
-    cs_async(x_uniform_mat3, &a, sizeof a);
-}
-
-// ================================================================ цели рендера
-static void check_fbo(void *arg)
-{
-    const u32 *rt = arg;
-    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (st != GL_FRAMEBUFFER_COMPLETE)
-        fprintf(stderr, "[d3d8] framebuffer incomplete 0x%x (rt %ux%u fmt %u)\n", st, rt[0], rt[1], rt[2]);
-}
-
-void d3d8_bind_target(d3ddev *d)
-{
-    if (!d)
-        return;
-    if (!d->fbo)
-        glGenFramebuffers(1, &d->fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, d->fbo);
-    if (d->fbo_rt != d->rt) {
-        d3d8_fbo_attach(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, d->rt);
-        d->fbo_rt = d->rt;
+    if (!r->fbo)
+        glGenFramebuffers(1, &r->fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
+    if (r->fbo_rt != r->rt) {
+        d3d8_fbo_attach(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, r->rt);
+        r->fbo_rt = r->rt;
     }
-    if (d->fbo_ds != d->ds) {
-        d3dsurf *s = d->ds;
+    if (r->fbo_ds != r->ds) {
+        d3dsurf *s = r->ds;
         const d3dfmt *f = s ? d3d8_format(s->fmt) : NULL;
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
         if (s)
             d3d8_fbo_attach(GL_FRAMEBUFFER, f->stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT, s);
-        d->fbo_ds = s;
+        r->fbo_ds = s;
     }
-    u32 info[3] = {d->rt ? d->rt->w : 0, d->rt ? d->rt->h : 0, d->rt ? d->rt->fmt : 0};
-    cs_async(check_fbo, info, sizeof info);  // проверка в потоке рендера, без ожидания
-    d->gen_vp++;
-    d->gl_dirty |= GLD_ALL;
+    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (st != GL_FRAMEBUFFER_COMPLETE)
+        fprintf(stderr, "[d3d8] framebuffer incomplete 0x%x (rt %ux%u fmt %u)\n", st, r->rt ? r->rt->w : 0,
+                r->rt ? r->rt->h : 0, r->rt ? r->rt->fmt : 0);
+    r->gen_vp++;
+    r->gl_dirty |= GLD_ALL;
 }
 
 // ================================================================ ключ фиксированного конвейера
@@ -149,24 +129,52 @@ typedef struct {
     _Atomic int ready;  // собрана потоком рендера (программы прошлых запусков собираются в фоне)
 } ffprog;
 
-// Динамическая хеш-таблица указателей ffprog*: адреса структур стабильны при расширении таблицы,
-// поэтому фоновые задания link_program_bg с указателем на ffprog безопасны без cs_finish().
+// Динамическая хеш-таблица указателей ffprog*: принадлежит ИСКЛЮЧИТЕЛЬНО потоку рендера (Core 2).
 #define PROG_INIT_CAP 4096u
 #define PROG_MAX_CAP 65536u
 static ffprog **g_progs;
-static u32 g_prog_cap, g_nprogs;
+static u32 g_prog_cap;
+static _Atomic u32 g_nprogs;
 static GLuint g_cur_prog;
+static ffprog *g_mru[4];  // MRU-кеш последних программ: убирает хеширование и пробинг при повторяющихся материалах
+static ffkey g_cached_key;
+static ffprog *g_cached_prog;  // программа для текущего неизменного состояния (key_dirty == 0)
+
+// Копия таблицы объявлений вершинных шейдеров для Core 2 (обновляется через gl_cs)
+static struct {
+    int used;
+    vdecl decl;
+} g_r_vs[D3D8_MAX_VS];
+
+static int r_vdecl_for(const d3d_rstate *r, vdecl *out)
+{
+    if (r->vs < D3D8_VS_HANDLE_BASE) {
+        d3d8_decl_from_fvf(r->vs, out);
+        return out->n > 0;
+    }
+    u32 i = r->vs - D3D8_VS_HANDLE_BASE;
+    if (i >= D3D8_MAX_VS || !g_r_vs[i].used)
+        return 0;
+    *out = g_r_vs[i].decl;
+    return 1;
+}
 
 static u32 fnv(const void *p, size_t n)
 {
     const u8 *b = p;
-    u32 h = 2166136261u;
-    for (size_t i = 0; i < n; i++)
-        h = (h ^ b[i]) * 16777619u;
-    return h;
+    u64 h = 14695981039346656037ull;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        u64 w;
+        memcpy(&w, b + i, 8);
+        h = (h ^ w) * 1099511628211ull;
+    }
+    for (; i < n; i++)
+        h = (h ^ b[i]) * 1099511628211ull;
+    return (u32)(h ^ (h >> 32));
 }
 
-static void make_key(d3ddev *d, const vdecl *decl, ffkey *k)
+static void make_key(const d3d_rstate *d, const vdecl *decl, ffkey *k)
 {
     memset(k, 0, sizeof *k);
     for (int i = 0; i < decl->n; i++) {
@@ -214,7 +222,7 @@ static void make_key(d3ddev *d, const vdecl *decl, ffkey *k)
     if (k->alphafunc == 8)
         k->alphafunc = 0;
     k->clipmask = decl->rhw ? 0 : (u8)(rs[152] & 0x3F);
-    k->ps_hash = d->ps ? d3d8_ps_hash(d->ps) : 0;
+    k->ps_hash = d->ps ? d3d8_r_ps_hash(d->ps) : 0;
     int nst = 0;
     for (int s = 0; s < MAX_STAGES; s++) {
         const u32 *t = d->tss[s];
@@ -676,15 +684,15 @@ static u8 *bin_map_take(const ffkey *k, u32 h, u32 *out_fmt, u32 *out_size)
     return NULL;
 }
 
-static void bin_cache_init(void)
+// Вызывается на Core 2: пути уже разрешены на Core 1 через VFS (без обращений к vfs_* из потока рендера)
+static void bin_cache_init_r(const char *bin_in, const char *bin_out)
 {
     if (!g_bin_ok)
         return;
-    char host[1100];
     int valid = 0;
     u32 loaded = 0;
-    if (vfs_find(BIN_FILE, host, sizeof host)) {
-        FILE *f = fopen(host, "rb");
+    if (bin_in[0]) {
+        FILE *f = fopen(bin_in, "rb");
         if (f) {
             bin_hdr h;
             if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(&h, &g_bin_hdr, sizeof h)) {
@@ -707,17 +715,15 @@ static void bin_cache_init(void)
             fclose(f);
         }
     }
-    if (!vfs_for_write(BIN_FILE, g_bin_path, sizeof g_bin_path, 0)) {
-        g_bin_path[0] = 0;
+    snprintf(g_bin_path, sizeof g_bin_path, "%s", bin_out);
+    if (!g_bin_path[0])
         return;
-    }
     if (!valid) {
         FILE *f = fopen(g_bin_path, "wb");
         if (!f || fwrite(&g_bin_hdr, sizeof g_bin_hdr, 1, f) != 1)
             g_bin_path[0] = 0;
         if (f)
             fclose(f);
-        vfs_changed();
     }
     if (loaded)
         fprintf(stderr, "[d3d8] loaded %u cached GL program binaries\n", loaded);
@@ -837,24 +843,13 @@ static void link_body(link_args *a)
     }
 }
 
-static void link_program(void *arg)
+static void link_program(link_args *a)
 {
-    link_args *a = arg;
     u64 t0 = rt_ticks_ns();
     link_body(a);
     g_hitch.links++;  // строка [hitch] (d3d8_present)
     g_hitch.link_ns += rt_ticks_ns() - t0;
     atomic_store_explicit(&a->p->ready, 1, memory_order_release);
-}
-
-// Программы прошлых запусков (d3d8_prog_preload): исходники и бинарник в куче, освобождает поток рендера
-static void link_program_bg(void *arg)
-{
-    link_args *a = arg;
-    link_program(a);
-    free((void *)a->vs);
-    free((void *)a->fs);
-    free(a->bin_data);
 }
 
 static int prog_rehash(u32 new_cap)
@@ -896,8 +891,10 @@ static void prog_erase_at(u32 slot)
 
 static void prog_evict_old(int cur_frame)
 {
-    cs_finish();  // дождаться завершения фоновых сборок и отрисовок в потоке рендера
+    // Вызывается исключительно на Core 2: никаких cs_finish() не требуется
     g_cur_prog = 0;
+    g_cached_prog = NULL;
+    memset(g_mru, 0, sizeof g_mru);
     u32 removed = 0;
     static const int ages[] = {120, 60, 30, 15, 7, 3, 1, 0, -1};
     for (size_t k = 0; k < sizeof ages / sizeof ages[0] && g_nprogs >= g_prog_cap / 2u; k++) {
@@ -909,7 +906,7 @@ static void prog_evict_old(int cur_frame)
                     glDeleteProgram(p->prog);
                 free(p);
                 prog_erase_at(i);
-                g_nprogs--;
+                atomic_fetch_sub_explicit(&g_nprogs, 1, memory_order_relaxed);
                 removed++;
                 if (age < 0 && g_nprogs < g_prog_cap / 2u)
                     break;
@@ -918,7 +915,8 @@ static void prog_evict_old(int cur_frame)
             i++;
         }
     }
-    fprintf(stderr, "[d3d8] program cache evicted %u unused programs (%u remain)\n", removed, g_nprogs);
+    fprintf(stderr, "[d3d8] program cache evicted %u unused programs (%u remain)\n", removed,
+            atomic_load_explicit(&g_nprogs, memory_order_relaxed));
 }
 
 static ffprog *prog_find(const ffkey *k, u32 *h)
@@ -962,21 +960,22 @@ static ffprog *prog_insert(const ffkey *k, u32 h, int cur_frame)
     while (g_progs[i])
         i = (i + 1u) & (g_prog_cap - 1u);
     g_progs[i] = p;
-    g_nprogs++;
+    atomic_fetch_add_explicit(&g_nprogs, 1, memory_order_relaxed);
     return p;
 }
 
-// Ключи программ между запусками: <user>/System/SnxPrograms.bin (v2) — заголовок {MAGIC, VERSION, sizeof(ffkey)}
-// и записи {ffkey, u32 ps_ntok, u32 ps_tokens[ps_ntok]}. Программы с ps.1.x кешируются и предзагружаются так же,
-// как фиксированный конвейер. При наличии поддержки GL_NUM_PROGRAM_BINARY_FORMATS > 0 бинарники дополнительно
-// кешируются в <user>/System/SnxProgramBins.bin с валидацией по GL_VERSION, GL_RENDERER и версии генератора.
-void d3d8_prog_preload(void)
+typedef struct {
+    char bin_in[1100], bin_out[1100];
+    char prog_in[1100], prog_out[1100];
+} preload_args;
+
+static void x_prog_preload(void *arg)
 {
-    bin_cache_init();
-    char host[1100];
+    const preload_args *pa = arg;
+    bin_cache_init_r(pa->bin_in, pa->bin_out);
     u32 hdr[3] = {0}, n = 0, n_ps = 0, n_bin = 0;
-    if (vfs_find(PROG_FILE, host, sizeof host)) {
-        FILE *f = fopen(host, "rb");
+    if (pa->prog_in[0]) {
+        FILE *f = fopen(pa->prog_in, "rb");
         if (f && fread(hdr, 4, 3, f) == 3 && hdr[0] == PROG_MAGIC && hdr[1] == PROG_VERSION &&
             hdr[2] == sizeof(ffkey)) {
             ffkey k;
@@ -1012,16 +1011,20 @@ void d3d8_prog_preload(void)
                 }
                 u32 bfmt = 0, bsize = 0;
                 u8 *bdata = bin_map_take(&k, h, &bfmt, &bsize);
+                int had_bin = bdata != NULL;
                 sbuf vs = {0}, fs = {0};
                 gen_vs(&k, &vs);
                 gen_fs(&k, ps_body, &fs);
                 free(ps_body);
                 link_args a = {p, vs.p, fs.p, bdata, bfmt, bsize};
-                cs_async(link_program_bg, &a, sizeof a);
+                link_program(&a);
+                free(vs.p);
+                free(fs.p);
+                free(bdata);
                 n++;
                 if (k.ps_hash)
                     n_ps++;
-                if (bdata)
+                if (had_bin)
                     n_bin++;
             }
         } else if (f) {
@@ -1030,51 +1033,99 @@ void d3d8_prog_preload(void)
         if (f)
             fclose(f);
     }
-    if (!vfs_for_write(PROG_FILE, g_prog_path, sizeof g_prog_path, 0)) {
-        g_prog_path[0] = 0;
-        return;
-    }
-    if (hdr[0] != PROG_MAGIC) {
+    snprintf(g_prog_path, sizeof g_prog_path, "%s", pa->prog_out);
+    if (g_prog_path[0] && hdr[0] != PROG_MAGIC) {
         FILE *f = fopen(g_prog_path, "wb");
         u32 h[3] = {PROG_MAGIC, PROG_VERSION, (u32)sizeof(ffkey)};
         if (!f || fwrite(h, 4, 3, f) != 3)
             g_prog_path[0] = 0;
         if (f)
             fclose(f);
-        vfs_changed();
     }
-    fprintf(stderr, "[d3d8] %u programs (%u ps, %u binaries) from earlier runs queued for background build\n", n, n_ps,
-            n_bin);
+    g_cur_prog = 0;
+    fprintf(stderr, "[d3d8] %u programs (%u ps, %u binaries) preloaded on render thread\n", n, n_ps, n_bin);
 }
 
-static ffprog *program_for(d3ddev *d, const ffkey *k)
+// Ключи программ между запусками: <user>/System/SnxPrograms.bin (v2) и кеш бинарников SnxProgramBins.bin.
+// Пути VFS разрешаются на Core 1, а разбор и компиляция шейдеров выполняются асинхронно на Core 2.
+void d3d8_prog_preload(void)
 {
+    preload_args pa;
+    memset(&pa, 0, sizeof pa);
+    if (g_bin_ok) {
+        if (!vfs_find(BIN_FILE, pa.bin_in, sizeof pa.bin_in))
+            pa.bin_in[0] = 0;
+        if (!vfs_for_write(BIN_FILE, pa.bin_out, sizeof pa.bin_out, 0))
+            pa.bin_out[0] = 0;
+        else if (!pa.bin_in[0])
+            vfs_changed();
+    }
+    if (!vfs_find(PROG_FILE, pa.prog_in, sizeof pa.prog_in))
+        pa.prog_in[0] = 0;
+    if (!vfs_for_write(PROG_FILE, pa.prog_out, sizeof pa.prog_out, 0))
+        pa.prog_out[0] = 0;
+    else if (!pa.prog_in[0])
+        vfs_changed();
+    cs_async(x_prog_preload, &pa, sizeof pa);
+}
+
+static void prog_mru_put(ffprog *p)
+{
+    for (int i = 0; i < 4; i++) {
+        if (g_mru[i] == p) {
+            for (int j = i; j > 0; j--)
+                g_mru[j] = g_mru[j - 1];
+            g_mru[0] = p;
+            return;
+        }
+    }
+    g_mru[3] = g_mru[2];
+    g_mru[2] = g_mru[1];
+    g_mru[1] = g_mru[0];
+    g_mru[0] = p;
+}
+
+// Исполняется исключительно на Core 2: при промахе кеша шейдер компилируется и сохраняется прямо здесь,
+// без cs_sync и остановки потока гостя (Core 1)!
+static ffprog *program_for(d3d_rstate *r, const ffkey *k)
+{
+    for (int i = 0; i < 4; i++) {
+        ffprog *p = g_mru[i];
+        if (p && !memcmp(&p->key, k, sizeof *k)) {
+            if (i > 0) {
+                for (int j = i; j > 0; j--)
+                    g_mru[j] = g_mru[j - 1];
+                g_mru[0] = p;
+            }
+            p->last_frame = r->frame;
+            return p;
+        }
+    }
     u32 h;
     ffprog *p = prog_find(k, &h);
     if (p) {
-        if (!atomic_load_explicit(&p->ready, memory_order_acquire))
-            cs_finish();  // ещё в фоновой очереди: дождаться (только сразу после запуска)
-        p->last_frame = d->frame;
+        p->last_frame = r->frame;
+        prog_mru_put(p);
         return p;
     }
-    p = prog_insert(k, h, d->frame);
+    p = prog_insert(k, h, r->frame);
     if (!p)
         return NULL;
-    const char *ps_body = k->ps_hash ? d3d8_ps_glsl(d->ps) : NULL;
+    const char *ps_body = k->ps_hash ? d3d8_r_ps_glsl(r->ps) : NULL;
     u32 bfmt = 0, bsize = 0;
     u8 *bdata = bin_map_take(k, h, &bfmt, &bsize);
     sbuf vs = {0}, fs = {0};
     gen_vs(k, &vs);
     gen_fs(k, ps_body, &fs);
     link_args a = {p, vs.p, fs.p, bdata, bfmt, bsize};
-    cs_sync(link_program, &a);  // компиляция и сборка — в потоке рендера, одним ожиданием
+    link_program(&a);
     g_cur_prog = 0;
     free(vs.p);
     free(fs.p);
     free(bdata);
     if (g_prog_path[0]) {
         u32 ps_ntok = 0;
-        const u32 *ps_toks = k->ps_hash ? d3d8_ps_tokens(d->ps, &ps_ntok) : NULL;
+        const u32 *ps_toks = k->ps_hash ? d3d8_r_ps_tokens(r->ps, &ps_ntok) : NULL;
         if (!k->ps_hash || (ps_toks && ps_ntok > 0 && ps_ntok <= MAX_PS_SAVED)) {
             FILE *f = fopen(g_prog_path, "ab");
             if (f) {
@@ -1086,6 +1137,7 @@ static ffprog *program_for(d3ddev *d, const ffkey *k)
             }
         }
     }
+    prog_mru_put(p);
     return p;
 }
 
@@ -1097,7 +1149,7 @@ static void color4(float *o, u32 c)
     o[3] = (float)(c >> 24) / 255.0f;
 }
 
-static void upload_uniforms(d3ddev *d, ffprog *p)
+static void upload_uniforms(d3d_rstate *d, ffprog *p)
 {
     if (p->gen_xf != d->gen_xf) {
         float wv[16];
@@ -1112,7 +1164,7 @@ static void upload_uniforms(d3ddev *d, ffprog *p)
         if (p->u_nrm_mat >= 0) {
             float nm[9];
             compute_normal_mat(nm, wv);
-            upload_mat3(p->u_nrm_mat, nm);
+            glUniformMatrix3fv(p->u_nrm_mat, 1, GL_FALSE, nm);
         }
         p->gen_xf = d->gen_xf;
     }
@@ -1244,7 +1296,7 @@ static GLenum gl_stencil_op(u32 o)
     return o < 9 ? t[o] : GL_KEEP;
 }
 
-static void apply_state(d3ddev *d)
+static void apply_state(d3d_rstate *d)
 {
     u32 dirty = d->gl_dirty;
     if (!dirty)
@@ -1339,11 +1391,17 @@ static GLint gl_address(u32 a)
 // Возможности GL (анизотропия и кеш бинарников программ) — проверяются один раз при создании устройства
 static int g_aniso;
 
-static void probe_caps(void *arg)
+static void x_init_gl(void *arg)
 {
     d3ddev *d = arg;
+    d3d_rstate *r = &d->r;
+    glGenVertexArrays(1, &r->vao);
+    glBindVertexArray(r->vao);
+    glGenBuffers(1, &r->up_vbo);
+    glGenBuffers(1, &r->up_ibo);
+    glGenSamplers(MAX_STAGES, r->samplers);
     glGetError();
-    glSamplerParameterf(d->samplers[0], GL_TEXTURE_MAX_ANISOTROPY_EXT, 1.0f);
+    glSamplerParameterf(r->samplers[0], GL_TEXTURE_MAX_ANISOTROPY_EXT, 1.0f);
     g_aniso = glGetError() == GL_NO_ERROR;
 #ifdef GL_NUM_PROGRAM_BINARY_FORMATS
     GLint nfmts = 0;
@@ -1370,9 +1428,9 @@ static void probe_caps(void *arg)
 #endif
 }
 
-void d3d8_caps_probe(d3ddev *d) { cs_sync(probe_caps, d); }
+void d3d8_cmd_init_gl(d3ddev *d) { cs_sync(x_init_gl, d); }
 
-static void update_sampler(d3ddev *d, int s)
+static void update_sampler(d3d_rstate *d, int s)
 {
     const u32 *t = d->tss[s];
     GLuint sm = d->samplers[s];
@@ -1415,7 +1473,7 @@ static void vertex_count(u32 prim, u32 count, GLenum *mode, u32 *n)
 
 static u32 g_attr_enabled;
 
-static void setup_attribs(d3ddev *d, const vdecl *decl, const void *up, u32 up_stride, u32 up_bytes)
+static void setup_attribs(d3d_rstate *d, const vdecl *decl, const void *up, u32 up_stride, u32 up_bytes)
 {
     u32 want = 0;
     if (up) {
@@ -1435,7 +1493,6 @@ static void setup_attribs(d3ddev *d, const vdecl *decl, const void *up, u32 up_s
             d3dbuf *b = d->stream[e->stream];
             if (!b)
                 continue;
-            d3d8_buf_sync(b);
             glBindBuffer(GL_ARRAY_BUFFER, b->gl);
             stride = d->stride[e->stream];
         }
@@ -1470,17 +1527,19 @@ static void setup_attribs(d3ddev *d, const vdecl *decl, const void *up, u32 up_s
 }
 
 // SNX_DUMP_DRAWS=N: состояние каждой отрисовки кадра N (стадии, смешивание, матрицы текстур) — в stderr
-int d3d8_dumping(const d3ddev *d)
+static int dumping_frame(int cur_frame)
 {
     static int frame = -2;
     if (frame == -2) {
         const char *e = getenv("SNX_DUMP_DRAWS");
         frame = e ? atoi(e) : -1;
     }
-    return d->frame == frame;
+    return cur_frame == frame;
 }
 
-static void dump_draw(d3ddev *d, const ffkey *k, u32 prim, u32 count, int indexed)
+int d3d8_dumping(const d3ddev *d) { return d && dumping_frame(d->frame); }
+
+static void dump_draw(const d3d_rstate *d, const ffkey *k, u32 prim, u32 count, int indexed)
 {
     const u32 *rs = d->rs;
     fprintf(stderr, "[dump] draw %u: prim %u n %u %s rhw %u light %u | blend %u %u/%u z %u/%u/%u atest %u/%u/%u "
@@ -1505,71 +1564,666 @@ static void dump_draw(d3ddev *d, const ffkey *k, u32 prim, u32 count, int indexe
     }
 }
 
-void d3d8_draw(d3ddev *d, u32 prim, u32 count, int indexed, u32 first, u32 min_index, u32 num_vertices,
-               const void *up_vertices, u32 up_stride, const void *up_indices, u32 up_index_fmt)
+// ================================================================ команды D3D8 (Core 1 -> gl_cs -> Core 2)
+static u32 f2u_r(float f)
+{
+    u32 v;
+    memcpy(&v, &f, 4);
+    return v;
+}
+
+static void identity_r(float *m)
+{
+    memset(m, 0, 64);
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+// Чистые функции обновления d3d_rstate (выполняются на Core 2 и проверяются в d3d8_cs_test)
+void d3d8_r_apply_rs(d3d_rstate *r, u32 state, u32 val)
+{
+    if (state >= 256 || r->rs[state] == val)
+        return;
+    r->rs[state] = val;
+    switch (state) {
+    case 7: case 14: case 23:
+        r->gl_dirty |= GLD_DEPTH;
+        break;
+    case 8: case 47:
+        r->gl_dirty |= GLD_POLY;
+        break;
+    case 15: case 25: case 28: case 29: case 35: case 48:
+    case 137: case 140: case 141: case 142: case 143:
+    case 145: case 146: case 147: case 148:
+        r->key_dirty = 1;
+        break;
+    case 19: case 20: case 27: case 171:
+        r->gl_dirty |= GLD_BLEND;
+        break;
+    case 22:
+        r->gl_dirty |= GLD_CULL;
+        break;
+    case 24: case 34: case 36: case 37: case 38: case 60: case 139:
+        r->gen_const++;
+        break;
+    case 52: case 53: case 54: case 55: case 56: case 57: case 58: case 59:
+        r->gl_dirty |= GLD_STENCIL;
+        break;
+    case 152:
+        r->gl_dirty |= GLD_CLIP;
+        r->key_dirty = 1;
+        break;
+    case 168:
+        r->gl_dirty |= GLD_COLORMASK;
+        break;
+    default:
+        break;
+    }
+}
+
+void d3d8_r_apply_tss(d3d_rstate *r, u32 s, u32 t, u32 val)
+{
+    if (s >= MAX_STAGES || t >= 32 || r->tss[s][t] == val)
+        return;
+    r->tss[s][t] = val;
+    if (t >= 7 && t <= 10)
+        r->gen_bump++;
+    else if ((t >= 13 && t <= 21) || t == 25)
+        r->sampler_dirty |= 1u << s;
+    else if ((t >= 1 && t <= 6) || t == 11 || t == 24 || (t >= 26 && t <= 28))
+        r->key_dirty = 1;
+}
+
+void d3d8_r_apply_xf(d3d_rstate *r, u32 state, const float mat[16])
+{
+    if (state == 2) {
+        memcpy(r->view, mat, 64);
+        r->gen_xf++;
+        r->gen_view++;
+    } else if (state == 3) {
+        memcpy(r->proj, mat, 64);
+        r->gen_xf++;
+    } else if (state == 256) {
+        memcpy(r->world, mat, 64);
+        r->gen_xf++;
+    } else if (state >= 16 && state < 16 + MAX_STAGES) {
+        memcpy(r->texm[state - 16], mat, 64);
+        r->gen_texm++;
+    }
+}
+
+void d3d8_r_apply_tex(d3d_rstate *r, u32 s, d3dtex *t)
+{
+    if (s >= MAX_STAGES)
+        return;
+    d3dtex *old = r->tex[s];
+    u8 old_k = old ? (u8)(old->cube ? 2 : 1) : 0;
+    u8 new_k = t ? (u8)(t->cube ? 2 : 1) : 0;
+    r->tex[s] = t;
+    if (old_k != new_k)
+        r->key_dirty = 1;
+}
+
+typedef struct { d3ddev *d; int has_autodepth; u32 bb_w, bb_h; } cmd_reset_t;
+static void x_reset_defaults(void *p)
+{
+    const cmd_reset_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    memset(r->rs, 0, sizeof r->rs);
+    r->rs[7] = q->has_autodepth ? 1 : 0;
+    r->rs[8] = 3;
+    r->rs[9] = 2;
+    r->rs[14] = 1;
+    r->rs[16] = 1;
+    r->rs[19] = 2;
+    r->rs[20] = 1;
+    r->rs[22] = 3;
+    r->rs[23] = 4;
+    r->rs[25] = 8;
+    r->rs[37] = f2u_r(1.0f);
+    r->rs[38] = f2u_r(1.0f);
+    r->rs[53] = r->rs[54] = r->rs[55] = 1;
+    r->rs[56] = 8;
+    r->rs[58] = r->rs[59] = 0xFFFFFFFFu;
+    r->rs[60] = 0xFFFFFFFFu;
+    r->rs[136] = 1;
+    r->rs[137] = 1;
+    r->rs[141] = 1;
+    r->rs[142] = 1;
+    r->rs[145] = 1;
+    r->rs[146] = 2;
+    r->rs[154] = f2u_r(1.0f);
+    r->rs[155] = f2u_r(1.0f);
+    r->rs[166] = f2u_r(64.0f);
+    r->rs[161] = 1;
+    r->rs[162] = 0xFFFFFFFFu;
+    r->rs[164] = f2u_r(1.0f);
+    r->rs[168] = 0xF;
+    r->rs[171] = 1;
+    r->rs[172] = 3;
+    r->rs[173] = 1;
+    for (int s = 0; s < MAX_STAGES; s++) {
+        u32 *t = r->tss[s];
+        memset(t, 0, 32 * 4);
+        t[1] = s == 0 ? 4 : 1;
+        t[2] = 2;
+        t[3] = 1;
+        t[4] = s == 0 ? 2 : 1;
+        t[5] = 2;
+        t[6] = 1;
+        t[11] = (u32)s;
+        t[13] = t[14] = t[25] = 1;
+        t[16] = t[17] = 1;
+        t[21] = 1;
+        t[26] = t[27] = t[28] = 1;
+    }
+    identity_r(r->view);
+    identity_r(r->proj);
+    identity_r(r->world);
+    for (int s = 0; s < MAX_STAGES; s++)
+        identity_r(r->texm[s]);
+    memset(r->material, 0, sizeof r->material);
+    memset(r->light_on, 0, sizeof r->light_on);
+    r->vp[0] = r->vp[1] = 0;
+    r->vp[2] = q->bb_w;
+    r->vp[3] = q->bb_h;
+    r->vpz[0] = 0.0f;
+    r->vpz[1] = 1.0f;
+    r->sampler_dirty = 0xFF;
+    r->gen_xf++;
+    r->gen_view++;
+    r->gen_texm++;
+    r->gen_vp++;
+    r->gen_clip++;
+    r->gen_light++;
+    r->gen_mat++;
+    r->gen_const++;
+    r->gen_psc++;
+    r->gen_bump++;
+    r->gl_dirty = GLD_ALL;
+    r->key_dirty = 1;
+    r->decl_dirty = 1;
+    g_cached_prog = NULL;
+}
+
+void d3d8_cmd_reset_defaults(d3ddev *d, int has_autodepth, u32 bb_w, u32 bb_h)
+{
+    cmd_reset_t cmd = {d, has_autodepth, bb_w, bb_h};
+    cs_cmd_push(x_reset_defaults, &cmd, sizeof cmd);
+}
+
+static void x_unbind_all(void *p)
+{
+    d3ddev *d = *(d3ddev **)p;
+    d3d_rstate *r = &d->r;
+    memset(r->tex, 0, sizeof r->tex);
+    memset(r->stream, 0, sizeof r->stream);
+    r->indices = NULL;
+    r->gl_dirty = GLD_ALL;
+    r->key_dirty = 1;
+    g_cached_prog = NULL;
+}
+
+void d3d8_cmd_unbind_all(d3ddev *d) { cs_cmd_push(x_unbind_all, &d, sizeof d); }
+
+typedef struct { d3ddev *d; u32 state, val; } cmd_rs_t;
+static void x_rs(void *p) { const cmd_rs_t *q = p; d3d8_r_apply_rs(&q->d->r, q->state, q->val); }
+void d3d8_cmd_rs(d3ddev *d, u32 state, u32 val)
+{
+    cmd_rs_t cmd = {d, state, val};
+    cs_cmd_push(x_rs, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 stage, type, val; } cmd_tss_t;
+static void x_tss(void *p) { const cmd_tss_t *q = p; d3d8_r_apply_tss(&q->d->r, q->stage, q->type, q->val); }
+void d3d8_cmd_tss(d3ddev *d, u32 stage, u32 type, u32 val)
+{
+    cmd_tss_t cmd = {d, stage, type, val};
+    cs_cmd_push(x_tss, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 state; float mat[16]; } cmd_xf_t;
+static void x_xf(void *p) { const cmd_xf_t *q = p; d3d8_r_apply_xf(&q->d->r, q->state, q->mat); }
+void d3d8_cmd_xf(d3ddev *d, u32 state, const float mat[16])
+{
+    cmd_xf_t cmd;
+    cmd.d = d;
+    cmd.state = state;
+    memcpy(cmd.mat, mat, 64);
+    cs_cmd_push(x_xf, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 vp[4]; float vpz[2]; } cmd_vp_t;
+static void x_vp(void *p)
+{
+    const cmd_vp_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    memcpy(r->vp, q->vp, sizeof r->vp);
+    memcpy(r->vpz, q->vpz, sizeof r->vpz);
+    if (dumping_frame(r->frame))
+        fprintf(stderr, "[dump] SetViewport %u,%u %ux%u\n", r->vp[0], r->vp[1], r->vp[2], r->vp[3]);
+    r->gen_vp++;
+    r->gl_dirty |= GLD_VP;
+}
+void d3d8_cmd_vp(d3ddev *d, const u32 vp[4], const float vpz[2])
+{
+    cmd_vp_t cmd;
+    cmd.d = d;
+    memcpy(cmd.vp, vp, sizeof cmd.vp);
+    memcpy(cmd.vpz, vpz, sizeof cmd.vpz);
+    cs_cmd_push(x_vp, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; float mat[17]; } cmd_mat_t;
+static void x_mat(void *p)
+{
+    const cmd_mat_t *q = p;
+    memcpy(q->d->r.material, q->mat, sizeof q->d->r.material);
+    q->d->r.gen_mat++;
+}
+void d3d8_cmd_mat(d3ddev *d, const float mat[17])
+{
+    cmd_mat_t cmd;
+    cmd.d = d;
+    memcpy(cmd.mat, mat, sizeof cmd.mat);
+    cs_cmd_push(x_mat, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 idx; d3dlight l; } cmd_light_t;
+static void x_light(void *p)
+{
+    const cmd_light_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    if (r->lights[q->idx].type != q->l.type)
+        r->key_dirty = 1;
+    r->lights[q->idx] = q->l;
+    r->gen_light++;
+}
+void d3d8_cmd_light(d3ddev *d, u32 idx, const d3dlight *l)
+{
+    cmd_light_t cmd = {d, idx, *l};
+    cs_cmd_push(x_light, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 idx; u8 on; } cmd_light_en_t;
+static void x_light_en(void *p)
+{
+    const cmd_light_en_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    if (r->light_on[q->idx] != q->on)
+        r->key_dirty = 1;
+    r->light_on[q->idx] = q->on;
+    r->gen_light++;
+}
+void d3d8_cmd_light_enable(d3ddev *d, u32 idx, u8 on)
+{
+    cmd_light_en_t cmd = {d, idx, on};
+    cs_cmd_push(x_light_en, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 idx; float plane[4]; } cmd_clip_t;
+static void x_clip(void *p)
+{
+    const cmd_clip_t *q = p;
+    memcpy(q->d->r.clip[q->idx], q->plane, 16);
+    q->d->r.gen_clip++;
+}
+void d3d8_cmd_clip(d3ddev *d, u32 idx, const float plane[4])
+{
+    cmd_clip_t cmd = {d, idx, {plane[0], plane[1], plane[2], plane[3]}};
+    cs_cmd_push(x_clip, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; d3dtex *t; u32 stage; } cmd_tex_t;
+static void x_tex(void *p) { const cmd_tex_t *q = p; d3d8_r_apply_tex(&q->d->r, q->stage, q->t); }
+void d3d8_cmd_tex(d3ddev *d, u32 stage, d3dtex *t)
+{
+    cmd_tex_t cmd = {d, t, stage};
+    cs_cmd_push(x_tex, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; d3dbuf *b; u32 n, stride; } cmd_stream_t;
+static void x_stream(void *p)
+{
+    const cmd_stream_t *q = p;
+    q->d->r.stream[q->n] = q->b;
+    q->d->r.stride[q->n] = q->stride;
+}
+void d3d8_cmd_stream(d3ddev *d, u32 n, d3dbuf *b, u32 stride)
+{
+    cmd_stream_t cmd = {d, b, n, stride};
+    cs_cmd_push(x_stream, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; d3dbuf *b; u32 base_vertex; } cmd_indices_t;
+static void x_indices(void *p)
+{
+    const cmd_indices_t *q = p;
+    q->d->r.indices = q->b;
+    q->d->r.base_vertex = q->base_vertex;
+}
+void d3d8_cmd_indices(d3ddev *d, d3dbuf *b, u32 base_vertex)
+{
+    cmd_indices_t cmd = {d, b, base_vertex};
+    cs_cmd_push(x_indices, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 val; } cmd_u32_t;
+static void x_vs(void *p)
+{
+    const cmd_u32_t *q = p;
+    q->d->r.vs = q->val;
+    q->d->r.decl_dirty = 1;
+    q->d->r.key_dirty = 1;
+}
+void d3d8_cmd_vs(d3ddev *d, u32 vs)
+{
+    cmd_u32_t cmd = {d, vs};
+    cs_cmd_push(x_vs, &cmd, sizeof cmd);
+}
+
+typedef struct { u32 idx; vdecl decl; } cmd_vs_set_t;
+static void x_vs_set(void *p)
+{
+    const cmd_vs_set_t *q = p;
+    if (q->idx < D3D8_MAX_VS) {
+        g_r_vs[q->idx].used = 1;
+        g_r_vs[q->idx].decl = q->decl;
+    }
+}
+void d3d8_cmd_vs_set(u32 idx, const vdecl *decl)
+{
+    cmd_vs_set_t cmd = {idx, *decl};
+    cs_cmd_push(x_vs_set, &cmd, sizeof cmd);
+}
+
+static void x_vs_del(void *p)
+{
+    u32 idx = *(const u32 *)p;
+    if (idx < D3D8_MAX_VS) {
+        g_r_vs[idx].used = 0;
+        memset(&g_r_vs[idx].decl, 0, sizeof g_r_vs[idx].decl);
+    }
+}
+void d3d8_cmd_vs_del(u32 idx) { cs_cmd_push(x_vs_del, &idx, sizeof idx); }
+
+static void x_ps(void *p)
+{
+    const cmd_u32_t *q = p;
+    q->d->r.ps = q->val;
+    q->d->r.key_dirty = 1;
+}
+void d3d8_cmd_ps(d3ddev *d, u32 ps)
+{
+    cmd_u32_t cmd = {d, ps};
+    cs_cmd_push(x_ps, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 reg, count; float data[8][4]; } cmd_psc_t;
+static void x_psc(void *p)
+{
+    const cmd_psc_t *q = p;
+    memcpy(q->d->r.psc[q->reg], q->data, (size_t)q->count * 16u);
+    q->d->r.gen_psc++;
+}
+void d3d8_cmd_psc(d3ddev *d, u32 reg, u32 count, const float data[][4])
+{
+    cmd_psc_t cmd;
+    cmd.d = d;
+    cmd.reg = reg;
+    cmd.count = count;
+    memcpy(cmd.data, data, (size_t)count * 16u);
+    cs_cmd_push(x_psc, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; d3dsurf *rt, *ds; int reset_vp; } cmd_rt_t;
+static void x_set_rt(void *p)
+{
+    const cmd_rt_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    if (q->reset_vp && dumping_frame(r->frame) && r->rt && r->rt->tex)
+        dump_target_r(r);
+    r->rt = q->rt;
+    r->ds = q->ds;
+    if (q->reset_vp && r->rt) {
+        if (dumping_frame(r->frame))
+            fprintf(stderr, "[dump] SetRenderTarget %ux%u fmt %x%s ds %ux%u\n", r->rt->w, r->rt->h, r->rt->fmt,
+                    r->rt->tex ? " (texture)" : "", r->ds ? r->ds->w : 0, r->ds ? r->ds->h : 0);
+        r->vp[0] = r->vp[1] = 0;
+        r->vp[2] = r->rt->w;
+        r->vp[3] = r->rt->h;
+        r->vpz[0] = 0.0f;
+        r->vpz[1] = 1.0f;
+    }
+    bind_target_r(r);
+}
+void d3d8_cmd_set_rt(d3ddev *d, d3dsurf *rt, d3dsurf *ds, int reset_vp)
+{
+    cmd_rt_t cmd = {d, rt, ds, reset_vp};
+    cs_cmd_push(x_set_rt, &cmd, sizeof cmd);
+}
+
+void d3d8_bind_target(d3ddev *d)
+{
+    if (d)
+        d3d8_cmd_set_rt(d, d->rt, d->ds, 0);
+}
+
+typedef struct {
+    d3ddev *d;
+    u32 flags, color, stencil, count;
+    float z;
+    const s32 *rects;
+    void *heap;
+} cmd_clear_t;
+
+static void x_clear(void *p)
+{
+    const cmd_clear_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    u32 flags = q->flags, color = q->color, count = q->count;
+    GLbitfield mask = 0;
+    if (flags & 1) {
+        mask |= GL_COLOR_BUFFER_BIT;
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor((float)((color >> 16) & 0xFF) / 255.0f, (float)((color >> 8) & 0xFF) / 255.0f,
+                     (float)(color & 0xFF) / 255.0f, (float)(color >> 24) / 255.0f);
+    }
+    if ((flags & 2) && r->ds) {
+        mask |= GL_DEPTH_BUFFER_BIT;
+        glDepthMask(GL_TRUE);
+        glClearDepth(q->z);
+    }
+    if ((flags & 4) && r->ds) {
+        mask |= GL_STENCIL_BUFFER_BIT;
+        glStencilMask(0xFF);
+        glClearStencil((GLint)q->stencil);
+    }
+    if (dumping_frame(r->frame))
+        fprintf(stderr, "[dump] Clear flags %x color %08x z %g rects %u vp %u,%u %ux%u\n", flags, color, q->z, count,
+                r->vp[0], r->vp[1], r->vp[2], r->vp[3]);
+    if (mask) {
+        glEnable(GL_SCISSOR_TEST);
+        if (!count || !q->rects) {
+            glScissor((GLint)r->vp[0], (GLint)r->vp[1], (GLsizei)r->vp[2], (GLsizei)r->vp[3]);
+            glClear(mask);
+        }
+        for (u32 i = 0; q->rects && i < count; i++) {
+            s32 x1 = q->rects[4u * i + 0], y1 = q->rects[4u * i + 1];
+            s32 x2 = q->rects[4u * i + 2], y2 = q->rects[4u * i + 3];
+            if (x2 > x1 && y2 > y1) {
+                glScissor(x1, y1, x2 - x1, y2 - y1);
+                glClear(mask);
+            }
+        }
+        r->gl_dirty |= GLD_SCISSOR;
+        if (flags & 1)
+            r->gl_dirty |= GLD_COLORMASK;
+        if ((flags & 2) && r->ds)
+            r->gl_dirty |= GLD_DEPTH;
+        if ((flags & 4) && r->ds)
+            r->gl_dirty |= GLD_STENCIL;
+    }
+    free(q->heap);
+}
+
+void d3d8_cmd_clear(d3ddev *d, u32 flags, u32 color, float z, u32 stencil, u32 count, const s32 *rects)
+{
+    cmd_clear_t cmd = {d, flags, color, stencil, count, z, rects, NULL};
+    cs_cmd_push_var(x_clear, &cmd, sizeof cmd, rects, (size_t)count * 16u,
+                    offsetof(cmd_clear_t, rects), offsetof(cmd_clear_t, heap));
+}
+
+// Исполнение отрисовки на Core 2: vdecl/ffkey/program кешируются между вызовами по флагам decl_dirty/key_dirty
+static void exec_draw(d3d_rstate *r, u32 prim, u32 count, int indexed, u32 first, u32 min_index, u32 num_vertices,
+                      const void *up_vertices, u32 up_stride, const void *up_indices, u32 up_index_fmt)
 {
     if (!count)
         return;
-    d->draws++;
-    vdecl decl;
-    if (!d3d8_vdecl_for(d, &decl)) {
+    r->draws++;
+    if (r->decl_dirty) {
+        r->decl_ok = r_vdecl_for(r, &r->cached_decl);
+        r->decl_dirty = 0;
+    }
+    if (!r->decl_ok) {
         hle_todo("d3d8: draw with an unknown vertex format");
         return;
     }
     GLenum mode;
     u32 n;
     vertex_count(prim, count, &mode, &n);
-    ffkey key;
-    make_key(d, &decl, &key);
-    if (d3d8_dumping(d))
-        dump_draw(d, &key, prim, count, indexed);
-    ffprog *p = program_for(d, &key);
+    if (r->key_dirty || !g_cached_prog) {
+        make_key(r, &r->cached_decl, &g_cached_key);
+        g_cached_prog = program_for(r, &g_cached_key);
+        r->key_dirty = 0;
+    }
+    if (dumping_frame(r->frame))
+        dump_draw(r, &g_cached_key, prim, count, indexed);
+    ffprog *p = g_cached_prog;
     if (!p || !p->prog)
         return;
-    apply_state(d);
+    p->last_frame = r->frame;
+    apply_state(r);
     if (g_cur_prog != p->prog) {
         glUseProgram(p->prog);
         g_cur_prog = p->prog;
     }
-    upload_uniforms(d, p);
-    for (int s = 0; s < key.nstages; s++) {
-        d3dtex *t = d->tex[s];
+    upload_uniforms(r, p);
+    for (int s = 0; s < g_cached_key.nstages; s++) {
+        d3dtex *t = r->tex[s];
         if (!t)
             continue;
         glActiveTexture(GL_TEXTURE0 + (GLenum)s);
         glBindTexture(t->cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, t->gl);
-        if (d->sampler_dirty & (1u << s)) {
-            update_sampler(d, s);
-            d->sampler_dirty &= ~(1u << s);
+        if (r->sampler_dirty & (1u << s)) {
+            update_sampler(r, s);
+            r->sampler_dirty &= ~(1u << s);
         }
-        glBindSampler((GLuint)s, d->samplers[s]);
+        glBindSampler((GLuint)s, r->samplers[s]);
     }
-    glBindVertexArray(d->vao);
+    glBindVertexArray(r->vao);
     if (!indexed) {
         if (up_vertices) {
-            setup_attribs(d, &decl, up_vertices, up_stride, n * up_stride);
+            setup_attribs(r, &r->cached_decl, up_vertices, up_stride, n * up_stride);
             glDrawArrays(mode, 0, (GLsizei)n);
         } else {
-            setup_attribs(d, &decl, NULL, 0, 0);
+            setup_attribs(r, &r->cached_decl, NULL, 0, 0);
             glDrawArrays(mode, (GLint)first, (GLsizei)n);
         }
     } else if (up_vertices) {
         u32 isize = up_index_fmt == FMT_INDEX32 ? 4 : 2;
-        setup_attribs(d, &decl, up_vertices, up_stride, (min_index + num_vertices) * up_stride);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, d->up_ibo);
+        setup_attribs(r, &r->cached_decl, up_vertices, up_stride, (min_index + num_vertices) * up_stride);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, r->up_ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, n * isize, up_indices, GL_STREAM_DRAW);
         glDrawElements(mode, (GLsizei)n, isize == 4 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, 0);
     } else {
-        d3dbuf *ib = d->indices;
+        d3dbuf *ib = r->indices;
         if (!ib)
             return;
         u32 isize = ib->fmt == FMT_INDEX32 ? 4 : 2;
-        setup_attribs(d, &decl, NULL, 0, 0);
-        d3d8_buf_sync(ib);
+        setup_attribs(r, &r->cached_decl, NULL, 0, 0);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl);
         glDrawElementsBaseVertex(mode, (GLsizei)n, isize == 4 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
-                                 (const void *)(uintptr_t)(first * isize), (GLint)d->base_vertex);
+                                 (const void *)(uintptr_t)(first * isize), (GLint)r->base_vertex);
     }
+}
+
+typedef struct {
+    d3ddev *d;
+    u32 prim, count, first, min_index, num_vertices;
+    int indexed;
+} cmd_draw_t;
+
+static void x_draw(void *p)
+{
+    const cmd_draw_t *q = p;
+    exec_draw(&q->d->r, q->prim, q->count, q->indexed, q->first, q->min_index, q->num_vertices, NULL, 0, NULL, 0);
+}
+
+void d3d8_cmd_draw(d3ddev *d, u32 prim, u32 count, int indexed, u32 first, u32 min_index, u32 num_vertices)
+{
+    cmd_draw_t cmd = {d, prim, count, first, min_index, num_vertices, indexed};
+    cs_cmd_push(x_draw, &cmd, sizeof cmd);
+}
+
+typedef struct {
+    d3ddev *d;
+    u32 prim, count, min_index, num_vertices, up_stride, up_index_fmt, idx_off;
+    int indexed;
+    const void *data;  // вершины в [0..vbytes), индексы в [idx_off..idx_off+ibytes) или up_indices в direct
+    const void *direct_idx;
+    void *heap;
+} cmd_draw_up_t;
+
+static void x_draw_up(void *p)
+{
+    const cmd_draw_up_t *q = p;
+    const u8 *base = q->data;
+    const void *idx = q->indexed ? (q->direct_idx ? q->direct_idx : (base ? base + q->idx_off : NULL)) : NULL;
+    exec_draw(&q->d->r, q->prim, q->count, q->indexed, 0, q->min_index, q->num_vertices, base, q->up_stride, idx,
+              q->up_index_fmt);
+    q->d->r.stream[0] = NULL;
+    q->d->r.stride[0] = 0;
+    if (q->indexed)
+        q->d->r.indices = NULL;
+    free(q->heap);
+}
+
+void d3d8_cmd_draw_up(d3ddev *d, u32 prim, u32 count, int indexed, u32 min_index, u32 num_vertices,
+                      const void *up_vertices, u32 up_stride, const void *up_indices, u32 up_index_fmt)
+{
+    if (!cs_enabled()) {
+        cmd_draw_up_t cmd = {d, prim, count, min_index, num_vertices, up_stride, up_index_fmt, 0, indexed,
+                             up_vertices, up_indices, NULL};
+        x_draw_up(&cmd);
+        return;
+    }
+    GLenum mode;
+    u32 n;
+    vertex_count(prim, count, &mode, &n);
+    u32 vbytes = indexed ? (min_index + num_vertices) * up_stride : n * up_stride;
+    u32 ibytes = indexed ? n * (up_index_fmt == FMT_INDEX32 ? 4u : 2u) : 0u;
+    if (!ibytes) {
+        cmd_draw_up_t cmd = {d, prim, count, min_index, num_vertices, up_stride, up_index_fmt, 0, indexed,
+                             up_vertices, NULL, NULL};
+        cs_cmd_push_var(x_draw_up, &cmd, sizeof cmd, up_vertices, vbytes,
+                        offsetof(cmd_draw_up_t, data), offsetof(cmd_draw_up_t, heap));
+        return;
+    }
+    u32 idx_off = (vbytes + 15u) & ~15u;
+    size_t total = (size_t)idx_off + ibytes;
+    u8 sbuf[4096];
+    u8 *pack = total <= sizeof sbuf ? sbuf : malloc(total);
+    if (!pack)
+        return;
+    if (vbytes)
+        memcpy(pack, up_vertices, vbytes);
+    memcpy(pack + idx_off, up_indices, ibytes);
+    cmd_draw_up_t cmd = {d, prim, count, min_index, num_vertices, up_stride, up_index_fmt, idx_off, indexed,
+                         pack, NULL, NULL};
+    cs_cmd_push_var(x_draw_up, &cmd, sizeof cmd, pack, total,
+                    offsetof(cmd_draw_up_t, data), offsetof(cmd_draw_up_t, heap));
+    if (pack != sbuf)
+        free(pack);
 }
 
 // ================================================================ снимки кадров (отладка)
@@ -1661,25 +2315,51 @@ static void write_png(const char *path, const u8 *rgba, u32 w, u32 h)
     free(z);
 }
 
-// кадр SNX_DUMP_DRAWS: содержимое текущей цели рендера (из её FBO) -> <SNX_SHOT_DIR>/dump_<n>.png
-void d3d8_dump_target(d3ddev *d)
+// кадр SNX_DUMP_DRAWS: содержимое текущей цели рендера (из её FBO на Core 2) -> <SNX_SHOT_DIR>/dump_<n>.png
+static void dump_target_r(d3d_rstate *r)
 {
     static int n;
-    if (!d->rt)
+    if (!r->rt)
         return;
-    u32 w = d->rt->w, h = d->rt->h;
+    u32 w = r->rt->w, h = r->rt->h;
     u8 *px = malloc((size_t)w * h * 4);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, d->fbo);
+    if (!px)
+        return;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, r->fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
     glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    glBindFramebuffer(GL_FRAMEBUFFER, d->fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
     char path[512];
     const char *dir = getenv("SNX_SHOT_DIR");
     snprintf(path, sizeof path, "%s%sdump_%02d.png", dir ? dir : "", dir ? "/" : "", n++);
     write_png(path, px, w, h);
     free(px);
     fprintf(stderr, "[dump] target %ux%u -> %s\n", w, h, path);
+}
+
+typedef struct {
+    d3ddev *d;
+    int from_win;
+    u32 w, h;
+    u8 *px;
+} shot_read_args;
+
+static void x_read_shot(void *arg)
+{
+    const shot_read_args *a = arg;
+    d3d_rstate *r = &a->d->r;
+    if (!a->from_win) {
+        if (!r->blit_fbo)
+            glGenFramebuffers(1, &r->blit_fbo);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, r->blit_fbo);
+        d3d8_fbo_attach(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, a->d->backbuffer);
+    } else {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    }
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glReadPixels(0, 0, (GLsizei)a->w, (GLsizei)a->h, GL_RGBA, GL_UNSIGNED_BYTE, a->px);
 }
 
 static void maybe_shot(d3ddev *d, int win_w, int win_h)
@@ -1700,17 +2380,8 @@ static void maybe_shot(d3ddev *d, int win_w, int win_h)
     u8 *px = malloc((size_t)w * h * 4);
     if (!px)
         return;
-    if (!from_win) {
-        if (!d->blit_fbo)
-            glGenFramebuffers(1, &d->blit_fbo);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, d->blit_fbo);
-        d3d8_fbo_attach(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, d->backbuffer);
-    } else {
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    }
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-    glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    shot_read_args sa = {d, from_win, w, h, px};
+    cs_sync(x_read_shot, &sa);
     if (from_win) {  // окно GL — снизу вверх; переворачиваем строки для PNG
         size_t row = (size_t)w * 4;
         u8 *tmp = malloc(row);
@@ -1783,6 +2454,144 @@ typedef struct {
 } present_pass_args;
 
 static GLuint g_post_prog, g_post_vao, g_gamma_tex;
+
+// ================================================================ 1-проходное GPU-размытие теней-проекторов
+// Эквивалент 9 проходов FCanvasUtil::DrawTile (3x3, смещение ±step_px, SrcAlpha=28/255, Dest=One)
+// в Engine.dll!0x121e0050 (UShadowBitmapMaterial::Get). Обе поверхности — D3D8 RTT («сверху вниз»),
+// поэтому UV без Y-переворота; GL_BLEND выключен, альфа результата = 1.0.
+static GLuint g_blur_prog, g_blur_vao, g_blur_sampler, g_blur_fbo;
+static GLint g_blur_u_step = -1;
+
+static void blur_init_gl(void)
+{
+    static const char vs_src[] =
+        SNX_GLSL_HEADER
+        "out vec2 v_uv;\n"
+        "void main() {\n"
+        "  vec2 p = vec2((gl_VertexID & 1) * 2, (gl_VertexID & 2));\n"
+        "  v_uv = p;\n"
+        "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+        "}\n";
+    static const char fs_src[] =
+        SNX_GLSL_HEADER
+        "in vec2 v_uv;\n"
+        "uniform sampler2D u_src;\n"
+        "uniform vec2 u_step;\n"
+        "out vec4 o_color;\n"
+        "void main() {\n"
+        "  vec3 s = vec3(0.0);\n"
+        "  s += texture(u_src, v_uv + vec2(-u_step.x, -u_step.y)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2(      0.0, -u_step.y)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2( u_step.x, -u_step.y)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2(-u_step.x,       0.0)).rgb;\n"
+        "  s += texture(u_src, v_uv                             ).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2( u_step.x,       0.0)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2(-u_step.x,  u_step.y)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2(      0.0,  u_step.y)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2( u_step.x,  u_step.y)).rgb;\n"
+        "  o_color = vec4(s * (28.0 / 255.0), 1.0);\n"
+        "}\n";
+    GLuint v = compile(GL_VERTEX_SHADER, vs_src), f = compile(GL_FRAGMENT_SHADER, fs_src);
+    if (v && f) {
+        g_blur_prog = glCreateProgram();
+        glAttachShader(g_blur_prog, v);
+        glAttachShader(g_blur_prog, f);
+        glLinkProgram(g_blur_prog);
+        GLint ok = 0;
+        glGetProgramiv(g_blur_prog, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            glDeleteProgram(g_blur_prog);
+            g_blur_prog = 0;
+        } else {
+            glUseProgram(g_blur_prog);
+            glUniform1i(glGetUniformLocation(g_blur_prog, "u_src"), 0);
+            g_blur_u_step = glGetUniformLocation(g_blur_prog, "u_step");
+            g_cur_prog = 0;
+        }
+    }
+    if (v)
+        glDeleteShader(v);
+    if (f)
+        glDeleteShader(f);
+    glGenVertexArrays(1, &g_blur_vao);
+    glGenFramebuffers(1, &g_blur_fbo);
+    glGenSamplers(1, &g_blur_sampler);
+    glSamplerParameteri(g_blur_sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glSamplerParameteri(g_blur_sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glSamplerParameteri(g_blur_sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glSamplerParameteri(g_blur_sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+typedef struct {
+    d3ddev *d;
+    d3dtex *src_tex;
+    d3dsurf *src_surf;
+    d3dsurf *dst_surf;
+    float step_px;
+} cmd_shadow_blur_t;
+
+static void x_shadow_blur(void *p)
+{
+    const cmd_shadow_blur_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    GLuint src_gl = q->src_tex ? q->src_tex->gl : (q->src_surf ? q->src_surf->color_tex : 0);
+    u32 src_w = q->src_tex ? q->src_tex->w : (q->src_surf ? q->src_surf->w : 0);
+    u32 src_h = q->src_tex ? q->src_tex->h : (q->src_surf ? q->src_surf->h : 0);
+    d3dsurf *dst = q->dst_surf;
+    if (!src_gl || !src_w || !src_h || !dst || !dst->w || !dst->h)
+        return;
+    if (!g_blur_prog)
+        blur_init_gl();
+    if (!g_blur_prog)
+        return;
+
+    int own_fbo = !(r->fbo && r->fbo_rt == dst);
+    if (own_fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, g_blur_fbo);
+        d3d8_fbo_attach(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, dst);
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
+    }
+
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    for (int i = 0; i < 6; i++)
+        glDisable(GL_CLIP_DISTANCE0 + i);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glViewport(0, 0, (GLsizei)dst->w, (GLsizei)dst->h);
+
+    glUseProgram(g_blur_prog);
+    glUniform2f(g_blur_u_step, q->step_px / (float)src_w, q->step_px / (float)src_h);
+    glBindVertexArray(g_blur_vao);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, src_gl);
+    glBindSampler(0, g_blur_sampler);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    // Восстановить FBO, VAO, сэмплер/текстуру 0 и пометить фиксированное состояние GL грязным
+    if (own_fbo) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
+    }
+    glBindVertexArray(r->vao);
+    glBindSampler(0, r->samplers[0]);
+    glBindTexture(GL_TEXTURE_2D, (r->tex[0] && !r->tex[0]->cube) ? r->tex[0]->gl : 0);
+    r->gl_dirty = GLD_ALL;
+    r->sampler_dirty |= 1u;
+    g_cur_prog = 0;
+    r->draws++;
+}
+
+void d3d8_cmd_shadow_blur(d3ddev *d, d3dtex *src_tex, d3dsurf *src_surf, d3dsurf *dst_surf, float step_px)
+{
+    cmd_shadow_blur_t cmd = {d, src_tex, src_surf, dst_surf, step_px};
+    cs_cmd_push(x_shadow_blur, &cmd, sizeof cmd);
+}
 
 static void post_init_gl(void)
 {
@@ -1913,6 +2722,31 @@ static void draw_fps(int n, int w, int h)
     glDisable(GL_SCISSOR_TEST);
 }
 
+typedef struct { int n, w, h; } draw_fps_args;
+
+static void x_draw_fps(void *arg)
+{
+    const draw_fps_args *a = arg;
+    draw_fps(a->n, a->w, a->h);
+}
+
+static void x_post_present(void *arg)
+{
+    d3ddev *d = *(d3ddev **)arg;
+    d3d_rstate *r = &d->r;
+    glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
+    glBindVertexArray(r->vao);
+    r->gl_dirty = GLD_ALL;
+    g_cur_prog = 0;
+    r->draws = 0;
+    r->frame++;
+    if (r->frame < 5 || r->frame % 300 == 0) {
+        GLenum err = glGetError();
+        if (err)
+            fprintf(stderr, "[d3d8] GL error 0x%x by frame %d\n", err, r->frame);
+    }
+}
+
 // Долгий кадр (дольше 40 мс и в полтора раза дольше обычного): что в нём было — сборка программ GL, чтения файлов
 // с диска, заливка текстур, ожидание гостем потока рендера (фризы на новых эффектах и в отдельных местах карты)
 static void hitch_check(d3ddev *d)
@@ -1985,14 +2819,17 @@ void d3d8_present(d3ddev *d)
         ov_t0 = ov_now;
         ov_frame0 = d->frame;
     }
-    if (g_fps_overlay)
-        draw_fps(ov_fps, w, h);
+    if (g_fps_overlay) {
+        draw_fps_args fa = {ov_fps, w, h};
+        cs_cmd_push(x_draw_fps, &fa, sizeof fa);
+    }
     maybe_shot(d, w, h);
     hitch_check(d);
     if (hle_frame_hook)
         hle_frame_hook(d->frame);
     if (d->frame < 5 || d->frame % 600 == 0)
-        fprintf(stderr, "[d3d8] frame %d: %u draws, %u programs\n", d->frame, d->draws, g_nprogs);
+        fprintf(stderr, "[d3d8] frame %d: %u draws, %u programs\n", d->frame, d->draws,
+                atomic_load_explicit(&g_nprogs, memory_order_relaxed));
     // частота кадров раз в 5 с (на Switch — в терминал nxlink)
     static u64 fps_t0;
     static int fps_frame0;
@@ -2038,17 +2875,8 @@ void d3d8_present(d3ddev *d)
     }
     d->draws = 0;
     cs_swap();
-    glBindFramebuffer(GL_FRAMEBUFFER, d->fbo);
-    glBindVertexArray(d->vao);
-    d->gl_dirty = GLD_ALL;
-    g_cur_prog = 0;
+    cs_cmd_push(x_post_present, &d, sizeof d);
     d->frame++;
-    // glGetError ждёт драйвер (с glthread/потоком рендера — всю очередь): не каждый кадр
-    if (d->frame < 5 || d->frame % 300 == 0) {
-        GLenum err = glGetError();
-        if (err)
-            fprintf(stderr, "[d3d8] GL error 0x%x by frame %d\n", err, d->frame);
-    }
 }
 
 int d3d8_window_to_target(float u, float v, int *x, int *y)

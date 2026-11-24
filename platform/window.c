@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 
 #include "platform/gl.h"
+#include "platform/platform.h"
 
 plat_event_fn plat_on_event;
 void (*plat_on_tick)(void);
@@ -315,6 +316,7 @@ void plat_gl_unbind(void)
 void plat_shutdown(void)
 {
 #ifdef __SWITCH__
+    rt_platform_cpu_boost_reset();
     if (g_applet_hooked) {
         appletUnhook(&g_applet_cookie);
         g_applet_hooked = 0;

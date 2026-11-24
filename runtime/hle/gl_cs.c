@@ -5,6 +5,7 @@
 #include "runtime/hle/gl_cs.h"
 
 #include <pthread.h>
+#include <stdalign.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,11 +16,11 @@
 #include "runtime/rt.h"
 
 typedef struct cs_rec cs_rec;
-typedef void (*cs_exec)(cs_rec *r);
+typedef void (*cs_exec)(void *r);
 struct cs_rec {
     cs_exec exec;  // NULL — пропуск до начала кольца
     uint32_t size; // байт записи вместе с заголовком, кратно 16
-    uint32_t pad;
+    uint32_t flags;  // 0 — передать r; 1 — передать r + 1 (компактная команда cs_cmd_push*)
 };
 
 #define RING_SIZE (64u << 20)
@@ -31,24 +32,29 @@ struct cs_rec {
 // голова очереди публикуется порциями: поток рендера читает её в цикле, и запись после каждой команды гоняла
 // строку кеша между ядрами (cs_end ≈1,6 % потока гостя на Switch)
 #define PUBLISH_BYTES 2048u
+// хвост очереди обновляется пакетами записей (и сразу в конце пачки или при ожидании гостя), чтобы не
+// гонять строку кеша g_tail между Core 2 и Core 1 на каждой из ~15 000 команд кадра
+#define TAIL_BATCH 32u
 
 static uint8_t *g_ring;
-static _Atomic uint64_t g_head, g_tail;  // опубликовано писателем / исполнено читателем
-static _Atomic uint64_t g_wr;            // позиция писателя (пишет поток гостя; читается cs_stop при выходе)
-static uint64_t g_woken;                 // g_wr при последнем пробуждении потока рендера (только поток гостя)
-static uint64_t g_published;             // g_wr при последней публикации g_head (только поток гостя)
-static uint64_t g_swap_end[4], g_frames;  // конец записи показа кадра (по номеру кадра)
+// Разнесение горячих атомарных счётчиков по 64-байтным строкам кеша (убирает false sharing Core 1 <-> Core 2)
+alignas(64) static _Atomic uint64_t g_wr;  // позиция писателя (пишет поток гостя; читается cs_stop при выходе)
+static uint64_t g_woken;                   // g_wr при последнем пробуждении потока рендера (только поток гостя)
+static uint64_t g_published;               // g_wr при последней публикации g_head (только поток гостя)
+static uint64_t g_swap_end[4], g_frames;   // конец записи показа кадра (по номеру кадра)
+alignas(64) static _Atomic uint64_t g_head;  // опубликовано писателем (Core 1 -> Core 2)
+alignas(64) static _Atomic uint64_t g_tail;  // исполнено читателем (Core 2 -> Core 1)
+alignas(64) static _Atomic uint64_t g_wait_target = UINT64_MAX;  // поток гостя ждёт хвост >= target
+alignas(64) static _Atomic int g_render_sleeping;                // поток рендера спит на g_cv_work
 static _Atomic int g_on;
-static _Atomic int g_stop;               // запрос завершения потока рендера после дренажа очереди
-static _Atomic int g_exited;             // поток рендера завершил цикл
+static _Atomic int g_stop;                 // запрос завершения потока рендера после дренажа очереди
+static _Atomic int g_exited;               // поток рендера завершил цикл
 static _Thread_local int t_render;
 static pthread_t g_thread;
 
 static pthread_mutex_t g_life_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv_work = PTHREAD_COND_INITIALIZER, g_cv_progress = PTHREAD_COND_INITIALIZER;
-static _Atomic int g_render_sleeping;
-static _Atomic uint64_t g_wait_target = UINT64_MAX;  // поток гостя ждёт, пока хвост не дойдёт до этой позиции
 
 // статистика для строки fps (cs_stats_take): g_st — пишет поток гостя, busy/swap — поток рендера
 static cs_stats g_st;
@@ -91,7 +97,8 @@ static void wake_render(void)
 
 static void wake_guest(uint64_t tail)
 {
-    if (tail >= atomic_load(&g_wait_target)) {
+    uint64_t wt = atomic_load(&g_wait_target);
+    if (wt != UINT64_MAX && tail >= wt) {
         pthread_mutex_lock(&g_mx);
         pthread_cond_broadcast(&g_cv_progress);
         pthread_mutex_unlock(&g_mx);
@@ -142,6 +149,7 @@ static void *cs_begin(size_t size, cs_exec exec)
     cs_rec *r = (cs_rec *)(g_ring + off);
     r->exec = exec;
     r->size = (uint32_t)size;
+    r->flags = 0;
     atomic_store_explicit(&g_wr, pos + size, memory_order_relaxed);
     g_st.recs++;
     g_st.bytes += size;
@@ -211,14 +219,20 @@ static void *render_main(void *arg)
             }
         }
         u64 t0 = rt_ticks_ns();
+        uint32_t since_tail = 0;
         while (tail != head) {
             cs_rec *r = (cs_rec *)(g_ring + tail % RING_SIZE);
             uint32_t size = r->size;
             if (r->exec)
-                r->exec(r);
+                r->exec(r->flags ? (void *)(r + 1) : (void *)r);
             tail += size;
-            atomic_store(&g_tail, tail);
-            wake_guest(tail);
+            since_tail++;
+            if (since_tail >= TAIL_BATCH || tail == head ||
+                atomic_load_explicit(&g_wait_target, memory_order_relaxed) != UINT64_MAX) {
+                atomic_store(&g_tail, tail);  // seq_cst: пара к atomic_store(&g_wait_target) в wait_tail
+                since_tail = 0;
+                wake_guest(tail);
+            }
         }
         atomic_fetch_add(&g_busy_ns, rt_ticks_ns() - t0);
     }
@@ -302,7 +316,7 @@ typedef struct {
     void *arg;
 } r_sync;
 
-static void x_sync(cs_rec *r)
+static void x_sync(void *r)
 {
     r_sync *q = (r_sync *)r;
     q->fn(q->arg);
@@ -328,7 +342,7 @@ typedef struct {
     void *arg, *heap;
 } r_async;
 
-static void x_async(cs_rec *r)
+static void x_async(void *r)
 {
     r_async *q = (r_async *)r;
     q->fn(q->arg);
@@ -350,6 +364,54 @@ void cs_async(void (*fn)(void *), const void *arg, size_t size)
     cs_end();
 }
 
+void cs_cmd_push(cs_cmd_fn fn, const void *payload, size_t payload_size)
+{
+    if (direct()) {
+        fn((void *)payload);
+        return;
+    }
+    cs_rec *r = cs_begin(sizeof(cs_rec) + payload_size, fn);
+    r->flags = 1;
+    if (payload_size)
+        memcpy(r + 1, payload, payload_size);
+    cs_end();
+}
+
+void cs_cmd_push_var(cs_cmd_fn fn, const void *hdr, size_t hdr_size, const void *data, size_t data_size,
+                     size_t ptr_field_off, size_t heap_field_off)
+{
+    if (direct()) {
+        fn((void *)hdr);
+        return;
+    }
+    size_t head = (sizeof(cs_rec) + hdr_size + 15) & ~(size_t)15;
+    const void *dst = NULL;
+    void *heap = NULL;
+    cs_rec *r;
+    if (!data || !data_size) {
+        r = cs_begin(head, fn);
+    } else if (data_size > BIG_DATA) {
+        r = cs_begin(head, fn);
+        heap = malloc(data_size);
+        if (heap)
+            memcpy(heap, data, data_size);
+        dst = heap;
+    } else {
+        r = cs_begin(head + data_size, fn);
+        memcpy((uint8_t *)r + head, data, data_size);
+        dst = (uint8_t *)r + head;
+    }
+    r->flags = 1;
+    uint8_t *pay = (uint8_t *)(r + 1);
+    memcpy(pay, hdr, hdr_size);
+    memcpy(pay + ptr_field_off, &dst, sizeof dst);
+    memcpy(pay + heap_field_off, &heap, sizeof heap);
+    cs_end();
+}
+
+uint64_t cs_wr_pos(void) { return atomic_load_explicit(&g_wr, memory_order_relaxed); }
+uint64_t cs_tail_pos(void) { return atomic_load_explicit(&g_tail, memory_order_acquire); }
+
 static void noop(void *arg) { (void)arg; }
 void cs_finish(void) { cs_sync(noop, NULL); }
 
@@ -361,7 +423,7 @@ void cs_stats_take(cs_stats *out)
     memset(&g_st, 0, sizeof g_st);
 }
 
-static void x_swap(cs_rec *r)
+static void x_swap(void *r)
 {
     (void)r;
     u64 t0 = rt_ticks_ns();
@@ -390,7 +452,7 @@ void cs_swap(void)
 #define CS_REC(name, ...) typedef struct { cs_rec h; __VA_ARGS__ } r_##name;
 #define CS_ASYNC_1(name, T1)                                                                                \
     CS_REC(name, T1 a1;)                                                                                    \
-    static void x_##name(cs_rec *r) { r_##name *q = (r_##name *)r; gl##name(q->a1); }                       \
+    static void x_##name(void *r) { r_##name *q = (r_##name *)r; gl##name(q->a1); }                         \
     void cs_gl##name(T1 a1)                                                                                 \
     {                                                                                                       \
         if (direct()) { gl##name(a1); return; }                                                             \
@@ -400,7 +462,7 @@ void cs_swap(void)
     }
 #define CS_ASYNC_2(name, T1, T2)                                                                            \
     CS_REC(name, T1 a1; T2 a2;)                                                                             \
-    static void x_##name(cs_rec *r) { r_##name *q = (r_##name *)r; gl##name(q->a1, q->a2); }                \
+    static void x_##name(void *r) { r_##name *q = (r_##name *)r; gl##name(q->a1, q->a2); }                  \
     void cs_gl##name(T1 a1, T2 a2)                                                                          \
     {                                                                                                       \
         if (direct()) { gl##name(a1, a2); return; }                                                         \
@@ -410,7 +472,7 @@ void cs_swap(void)
     }
 #define CS_ASYNC_3(name, T1, T2, T3)                                                                        \
     CS_REC(name, T1 a1; T2 a2; T3 a3;)                                                                      \
-    static void x_##name(cs_rec *r) { r_##name *q = (r_##name *)r; gl##name(q->a1, q->a2, q->a3); }         \
+    static void x_##name(void *r) { r_##name *q = (r_##name *)r; gl##name(q->a1, q->a2, q->a3); }           \
     void cs_gl##name(T1 a1, T2 a2, T3 a3)                                                                   \
     {                                                                                                       \
         if (direct()) { gl##name(a1, a2, a3); return; }                                                     \
@@ -420,7 +482,7 @@ void cs_swap(void)
     }
 #define CS_ASYNC_4(name, T1, T2, T3, T4)                                                                    \
     CS_REC(name, T1 a1; T2 a2; T3 a3; T4 a4;)                                                               \
-    static void x_##name(cs_rec *r) { r_##name *q = (r_##name *)r; gl##name(q->a1, q->a2, q->a3, q->a4); }  \
+    static void x_##name(void *r) { r_##name *q = (r_##name *)r; gl##name(q->a1, q->a2, q->a3, q->a4); }    \
     void cs_gl##name(T1 a1, T2 a2, T3 a3, T4 a4)                                                            \
     {                                                                                                       \
         if (direct()) { gl##name(a1, a2, a3, a4); return; }                                                 \
@@ -430,7 +492,7 @@ void cs_swap(void)
     }
 #define CS_ASYNC_5(name, T1, T2, T3, T4, T5)                                                                \
     CS_REC(name, T1 a1; T2 a2; T3 a3; T4 a4; T5 a5;)                                                        \
-    static void x_##name(cs_rec *r)                                                                         \
+    static void x_##name(void *r)                                                                           \
     {                                                                                                       \
         r_##name *q = (r_##name *)r;                                                                        \
         gl##name(q->a1, q->a2, q->a3, q->a4, q->a5);                                                        \
@@ -444,7 +506,7 @@ void cs_swap(void)
     }
 #define CS_ASYNC_6(name, T1, T2, T3, T4, T5, T6)                                                            \
     CS_REC(name, T1 a1; T2 a2; T3 a3; T4 a4; T5 a5; T6 a6;)                                                 \
-    static void x_##name(cs_rec *r)                                                                         \
+    static void x_##name(void *r)                                                                           \
     {                                                                                                       \
         r_##name *q = (r_##name *)r;                                                                        \
         gl##name(q->a1, q->a2, q->a3, q->a4, q->a5, q->a6);                                                 \
@@ -458,7 +520,7 @@ void cs_swap(void)
     }
 #define CS_ASYNC_10(name, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10)                                          \
     CS_REC(name, T1 a1; T2 a2; T3 a3; T4 a4; T5 a5; T6 a6; T7 a7; T8 a8; T9 a9; T10 a10;)                   \
-    static void x_##name(cs_rec *r)                                                                         \
+    static void x_##name(void *r)                                                                           \
     {                                                                                                       \
         r_##name *q = (r_##name *)r;                                                                        \
         gl##name(q->a1, q->a2, q->a3, q->a4, q->a5, q->a6, q->a7, q->a8, q->a9, q->a10);                    \
@@ -575,14 +637,14 @@ typedef struct {
     void *heap;
 } r_uniformv;
 
-static void x_uniform4fv(cs_rec *r)
+static void x_uniform4fv(void *r)
 {
     r_uniformv *q = (r_uniformv *)r;
     glUniform4fv(q->loc, q->count, q->v);
     free(q->heap);
 }
 
-static void x_uniform_matrix4fv(cs_rec *r)
+static void x_uniform_matrix4fv(void *r)
 {
     r_uniformv *q = (r_uniformv *)r;
     glUniformMatrix4fv(q->loc, q->count, q->transpose, q->v);
@@ -625,7 +687,7 @@ typedef struct {
     GLfloat v[4];
 } r_samplerfv;
 
-static void x_samplerfv(cs_rec *r)
+static void x_samplerfv(void *r)
 {
     r_samplerfv *q = (r_samplerfv *)r;
     glSamplerParameterfv(q->s, q->pname, q->v);
@@ -653,14 +715,14 @@ typedef struct {
     void *heap;
 } r_buffer;
 
-static void x_buffer_data(cs_rec *r)
+static void x_buffer_data(void *r)
 {
     r_buffer *q = (r_buffer *)r;
     glBufferData(q->target, q->size, q->data, q->usage);
     free(q->heap);
 }
 
-static void x_buffer_subdata(cs_rec *r)
+static void x_buffer_subdata(void *r)
 {
     r_buffer *q = (r_buffer *)r;
     glBufferSubData(q->target, q->off, q->size, q->data);
@@ -692,7 +754,7 @@ static void write_unsync(GLenum target, GLintptr off, GLsizeiptr size, const voi
         glBufferSubData(target, off, size, data);
 }
 
-static void x_buffer_unsync(cs_rec *r)
+static void x_buffer_unsync(void *r)
 {
     r_buffer *q = (r_buffer *)r;
     write_unsync(q->target, q->off, q->size, q->data);
@@ -732,14 +794,14 @@ typedef struct {
     void *heap;
 } r_teximage;
 
-static void x_teximage(cs_rec *r)
+static void x_teximage(void *r)
 {
     r_teximage *q = (r_teximage *)r;
     glTexImage2D(q->target, q->level, q->internal, q->width, q->height, 0, q->format, q->type, q->data);
     free(q->heap);
 }
 
-static void x_compressed_teximage(cs_rec *r)
+static void x_compressed_teximage(void *r)
 {
     r_teximage *q = (r_teximage *)r;
     glCompressedTexImage2D(q->target, q->level, (GLenum)q->internal, q->width, q->height, 0, q->size, q->data);
@@ -783,7 +845,7 @@ typedef struct {
     void *heap;
 } r_texsub;
 
-static void x_texsub(cs_rec *r)
+static void x_texsub(void *r)
 {
     r_texsub *q = (r_texsub *)r;
     glTexSubImage2D(q->target, q->level, q->x, q->y, q->width, q->height, q->format, q->type, q->data);
@@ -918,7 +980,7 @@ typedef struct {
     GLuint names[];
 } r_delete;
 
-static void x_delete(cs_rec *r)
+static void x_delete(void *r)
 {
     r_delete *q = (r_delete *)r;
     switch (q->kind) {

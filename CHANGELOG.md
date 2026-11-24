@@ -2,6 +2,109 @@
 
 Формат — по версиям, новые сверху. Замеры производительности относятся к указанной сборке и сцене.
 
+## 0.3.0 — 2026-11-24
+
+Крупный выпуск оптимизаций производительности и плавности на Nintendo Switch: D3D8-уровневый поток рендера на
+Core 2, нативный `D3DDrv`, 1-проходное GPU-размытие теней, ускорение рекомпилятора (`-ffixed-x28`,
+`SNX_FPU_FLOAT32`, слияние x87-сравнений, инлайн `RDTSC`, быстрый `RT_ICALL`), C/NEON-оверрайды `Engine`/`Core`/`CRT`,
+`FastLoad` CPU boost и устранение диалоговых фризов и краша автосейва. Готовые игровые NRO не распространяются.
+
+**Проверено на реальном Switch** (1280×720, CPU 1020 МГц, полный режим памяти, свежий PGO + `build/hot_order.ld`):
+- **`1_Shreks_Swamp.unr`** (3 582 кадра): **95,5%** кадров в 60 FPS (≤17 мс, было 39,4% на 0.2.0), среднее
+  **16,42 мс** (было 20,11), медиана **16 мс** (было 21), **p90 / p95 / p99: 17 / 17 / 20 мс** (p95 −8 мс),
+  max **34 мс** (было 50), **0 хичей**, активное время Core 1 **14,34 мс/кадр** (было 18,89, **−24,1%, ≈69,7
+  uncapped FPS**), Core 2 **32,6% IDLE**, покрытие L1I `.text < 48 КБ` **31,62%** (было 20,05%), `< 1 МБ`
+  **96,88%**, `SaveGame(0)` **347–364 мс** (было ~655 мс). Без PGO на той же сборке: медиана 17 мс, p90/p95/p99
+  20/21/24 мс, активный Core 1 15,93 мс/кадр (55,2% кадров ≤17 мс).
+- **`3_The_Hunt_Part4.unr`**: устранён краш автосейва, стабильные **49–53 FPS** на 7 300+ кадрах.
+
+**Проверено на macOS arm64:** CTest 14/14 (включая ASan+UBSan), `tests/test_recomp.py` 24/24, `recomp check`
+12/12 и 70/70 оверрайдов (EN и RUS), полный `tests/difftest/run_all.sh` 12/12 (11 265 pass, 0 регрессий),
+живые прогоны `1_Shreks_Swamp.unr` (5/5 сверок `SNX_*_CHECK=1`, A/B GPU shadow blur, `SNX_RENDER_THREAD=0`) и
+`3_The_Hunt_Part4.unr`.
+
+### Ускорено
+
+- **Нативный `D3DDrv` поверх прямого C-интерфейса D3D8 и 1-проходное GPU-размытие теней**
+  (`runtime/hle/d3d8_direct.h`, `runtime/hle/d3d8_{dev,ff,int}.{c,h}`, `runtime/overrides_engine.c`,
+  `recomp/overrides.py`, тесты `d3d8_cs_test` и `perf_ovr_test`):
+  - добавлен прямой C-интерфейс `d3d8_direct_*` поверх D3D8 Command Stream (минуя COM-трамплины и x86-стек), на
+    него переведены нативные оверрайды `D3DDrv.dll!0x1281fe80` (`CommitState`, −2,3×), `D3DDrv.dll!0x12819eb0`
+    (`SetMaterialPass`, −7,1×) и `D3DDrv.dll!0x12802100` (`ehvec_ctor`, −4×): доля `D3DDrv.dll` на Core 1 Switch
+    упала на **59%** (4,52 → 1,86 мс/кадр); добавлена сверка `SNX_D3D_COMMIT_CHECK=1`;
+  - 9-проходное размытие теней-проекторов `UShadowBitmapMaterial::Get` (`Engine.dll!0x121e0050`) заменено
+    1-проходным 9-таповым GLSL-шейдером на Core 2 (`d3d8_direct_shadow_blur` → `x_shadow_blur`, экономит 8 вызовов
+    отрисовки на тень, время теней на Core 1 −43%: 1,42 → 0,81 мс, нагрузка на Core 2 всего 0,35%; откат
+    `SNX_GPU_SHADOW_BLUR=0`).
+- **D3D8-уровневый Command Stream на Core 2 и zero-copy буферы** (`runtime/hle/{gl_cs,d3d8*,com}.{c,h}`,
+  тест `tests/rt/d3d8_cs_test.c`):
+  - весь `d3d8_ff.c` (формирование ключа с гранулярным `key_dirty`, кеш программ, сборка GLSL, матрицы, свет,
+    отрисовка и `Present`) перенесён на Core 2 под `#define GL_CS_NO_WRAP`, на Core 1 осталась лёгкая теневая
+    дедупликация `Set*` и отложенное освобождение ресурсов;
+  - для динамических VB/IB (`USAGE_DYNAMIC`) введены кольцевые zero-copy слоты (`DYN_SLOTS=4`, без копирования
+    вершин/индексов в кольцо на Core 1), а для однопоточных COM-объектов D3D8 убраны атомарные `AddRef`/`Release`;
+  - поток команд `[cs]` в steady-state сократился с 4 160 до 1 838 команд и с 384 до 99 КБ/кадр (macOS); на
+    Switch доля `d3d8_draw` на Core 1 упала с 5,05% до 0,20%, нагрузка перетекла на Core 2 (32,6% IDLE с PGO).
+- **Ядро рекомпилятора, `RT_ICALL`, L1I и инструменты Switch** (`recomp/{emit,gen}.py`, `runtime/icall_pin.c`,
+  `runtime/gen_rt.h`, `runtime/rt.c`, `runtime/abi.h`, `cmake/gen.cmake`, `CMakeLists.txt`,
+  `tools/probe/hotorder.py`, `tools/pgo_fetch.py`, `tests/test_recomp.py`):
+  - под `SNX_PIN` указатель `CPU *c` закреплён в регистре `x28` (`-ffixed-x28`, `SNX_C_PARAM`/`SNX_C_ARG`): число
+    инструкций `mov x0, x28` в первых 128 КБ `.text` упало с 689 до 6 (−99,1%), `RT_RDTSC()` инлайнится в
+    `mrs cntpct_el0` (`bl <rt_rdtsc>`: 382 → 0), а `RT_IC2` ужата до 32 КБ (4096 слотов, ровно L1D);
+  - слияние x87-сравнений (`fcom*/ftst → fnstsw ax → test ah/sahf → jcc/setcc/cmovcc`) в прямые IEEE-754
+    сравнения: инструкции NEON `cnt` в первых 192 КБ `.text` упали со 126 до 0 (−100%), по всему `.text` — с 3 469
+    до 129 (−96,3%);
+  - режим генерации `SNX_FPU_FLOAT32=1` с нативными `float f0..f7` для чистых f32-функций: число `fcvt` в первых
+    192 КБ упало с 1 583 до 527 (−66,7%), `.text` суммарно уменьшился на ~980 КБ;
+  - компактный `RT_ICALL` (8 инструкций inline с `add ..., asr #32`), пул pinned-обёрток `pin_wrap_000..3ff →
+    rt_pin_call_native` в выделенных секциях `.text.rt_pin_call_native`/`.text.pin_wrap` для COM/HLE и прямой
+    диспетчер `GNatives` (`rt_gnatives_cache[4096]`): доля `rt_icall_slow` на Switch упала с 1,69% до 0,70% self
+    (с 14,24% до 0,95% incl);
+  - `rt_icall_slow` вынесен в единую глобальную функцию в pinned-ABI (221 копия → 1 на `0x1a0`), а
+    `rt_pin_enter` помещён в отдельную секцию `.text.rt_pin_enter` (`0x130` вместо `0xd6f52c`);
+  - `tools/probe/hotorder.py` разделяет горячий код Core 1 (гость) и Core 2 (рендер/Mesa) в `build/hot_order.ld`
+    и снимает суффиксы клонов GCC (`.part.N`/`.constprop.N`/`.isra.N`), обеспечив 31,62% L1I `<48 КБ` и 96,88%
+    `<1 МБ` с PGO; в `tools/pgo_fetch.py` добавлены до 4 попыток с автопереподключением FTP, атомарная запись
+    через `.part` и вывод прогресса;
+  - добавлены `-fno-math-errno -fno-trapping-math` (вызовы `bl <sqrt>` на Switch: 350 → 6), атрибут `SNX_NO_JT`
+    для `switch (t)` под `-freorder-blocks-and-partition` (3 190 `.cold`-символов / 1,41 МиБ вынесено PGO),
+    инлайнинг константных `REP_MOVS`/`REP_STOS`, `-fvisibility=hidden` на Switch и выравнивание `rt_ic2` / `CPU`.
+- **Нативные C/NEON-оверрайды и `FastLoad`** (`recomp/overrides.py`, `runtime/overrides_{engine,crt,core}.c`,
+  `platform/platform.h`, `platform/switch/mem.c`, тест `tests/rt/perf_ovr_test.c`):
+  - NEON-реализация CPU-скиннинга `MeshSkinVerts` (`Engine.dll!0x121ed630`, на Switch: 2,44% → 1,22%) и частиц
+    `USpriteEmitter::FillVertexBuffer` (`Engine.dll!0x122039d0`, на Switch: 2,60% → 0,70–1,01%) со сверками
+    `SNX_SKIN_CHECK=1` и `SNX_PARTICLE_CHECK=1`;
+  - NEON-реализация `FConvexVolume::BoxCheck` / `SphereCheck` (`BoxCheck` на Switch: 2,22% → 1,90% Core 1);
+  - нативный `msvcr70.dll!qsort` с быстрым 16-байтным introsort для сортировки мешей без вызовов гостя и общим
+    путём с предрезолвом компаратора (3,34% → 0,86%);
+  - нативные листья `Core.dll` (`appMemcmp`, `FBox::operator+=`, `FVector::SafeNormal`, `FVector::Normalize`:
+    ~1,7% → 0,85%); добавлены режимы сверки `SNX_MATH_CHECK=1` и `SNX_QSORT_CHECK=1`;
+  - кратковременный CPU boost `ApmCpuBoostMode_FastLoad` на Switch вокруг `SaveGame` со сбросом при выходе и
+    ловушках: автосейв на болоте сократился с ~655 мс до **347–364 мс** (с PGO); фоновые файловые потоки
+    закреплены на ядре 0 с пониженным приоритетом.
+- **Оптимизации кольца, D3D8 и вибрации** (`runtime/hle/gl_cs.c`, `runtime/hle/d3d8_ff.c`, `runtime/hle/d3d8_res.c`,
+  `runtime/game/rumble.c`):
+  - поля кольца `gl_cs.c` разнесены по 64-байтным строкам кеша, обновление `g_tail` выполняется батчами по 32;
+  - в `d3d8_ff.c` добавлены 4-элементный MRU-кеш `prog_find` (0,96% → 0,09%), пословный 64-битный `fnv` и
+    асинхронный `glGetError`; в `d3d8_res.c` при `LOCK_DISCARD` с частичным диапазоном выполняется орфанинг +
+    заливка только грязного диапазона;
+  - в `rumble.c` увеличен кеш классов (256 → 2048 слотов) и введён инкрементальный обход объектов (1,15% → 0,07%).
+
+### Исправлено
+
+- **Фризы диалогов (300–450 мс) и сброса профиля на Switch** (`runtime/hle/kernel32_file.c`, `host/boot/prof.c`,
+  `tests/rt/wfile_test.c`): `FIMG_MAX` увеличен до 128 МБ (фоновая подкачка `AllDialog.uax` 115,8 МБ в RAM),
+  дефолт `SNX_FILE_CACHE_MB` поднят до 640 МБ, включён read-only кеш оверлейных `.int`/`.rus` с безопасной
+  инвалидацией при записи/удалении; в `prof.c` добавлен буфер записи 256 КБ (`setvbuf`) и понижение приоритета
+  потока `sampler` на Switch.
+- **Constant folding слабых `ovr_orig_*` на Switch GCC** (`runtime/ovr_orig_weak.c`, `runtime/overrides_*.c`):
+  13 слабых определений `= NULL` вынесены в отдельный TU, чтобы GCC под `-fvisibility=hidden` не выкидывал
+  fallback-вызовы оригинальных функций.
+- **Падение `hle_kernel32_WriteFile` на `3_The_Hunt_Part4`** (`runtime/hle/kernel32_file.c`, `host/boot/main.c`,
+  `tests/rt/wfile_test.c`): устранена гонка `hle_kernel32_WriteFile`/`close_file_` с `flush_files()`, добавлены
+  проверки ошибок `f_open`/`wb_flush_locked` и границ буфера `wbuf`; в `__libnx_exception_handler` граница
+  гостевого окна исправлена с 4 ГБ на `RT_WINDOW` (1 ГБ).
+
 ## 0.2.0 — 2026-11-23
 
 Консольный интерфейс и вибрация, рендер D3D8 с пост-проходом и кешем программ, тесты рантайма. Проверено в

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(shrekNX VERSION 0.2.0 LANGUAGES C CXX)
+project(shrekNX VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -116,6 +116,16 @@ include(cmake/snx.cmake)
 include(cmake/gen.cmake)
 
 add_subdirectory(runtime)
+if(SNX_PIN)
+  # Единая копия rt_icall_slow и пул pin_wrap_* в pinned-ABI (x19–x28), чтобы не дублировать их в каждом .c build/gen/
+  target_sources(snx_runtime PRIVATE "${PROJECT_SOURCE_DIR}/runtime/icall_pin.c")
+  set_source_files_properties("${PROJECT_SOURCE_DIR}/runtime/icall_pin.c" PROPERTIES COMPILE_OPTIONS "-ffixed-x28")
+endif()
+if(NINTENDO_SWITCH)
+  # Статическая линковка в один NRO: hidden убирает лишние GOT-загрузки в PIC/PIE для рантайма и HLE
+  target_compile_options(snx_runtime PRIVATE -fvisibility=hidden)
+  target_compile_options(snx_hle PRIVATE -fvisibility=hidden)
+endif()
 add_subdirectory(host/hello)
 add_subdirectory(host/boot)
 include(CTest)

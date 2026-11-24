@@ -18,9 +18,35 @@ typedef struct {
     u32 *tokens;
     u32 ntok;
     u64 hash;
-} ps_slot;
+} ps_obj;
 
-static ps_slot g_ps[MAX_PS];
+// Раздельные таблицы дескрипторов для Core 1 (g_ps) и Core 2 (r_ps): освобождение ps_obj идёт через gl_cs,
+// поэтому поток рендера всегда читает неизменяемую копию без гонок при DeletePixelShader.
+static ps_obj *g_ps[MAX_PS];
+static ps_obj *r_ps[MAX_PS];
+
+typedef struct {
+    u32 idx;
+    ps_obj *obj;
+} cmd_ps_t;
+
+static void x_ps_set(void *p)
+{
+    const cmd_ps_t *q = p;
+    r_ps[q->idx] = q->obj;
+}
+
+static void x_ps_del(void *p)
+{
+    const cmd_ps_t *q = p;
+    if (r_ps[q->idx] == q->obj)
+        r_ps[q->idx] = NULL;
+    if (q->obj) {
+        free(q->obj->glsl);
+        free(q->obj->tokens);
+        free(q->obj);
+    }
+}
 
 typedef struct {
     char *p;
@@ -300,16 +326,24 @@ u32 d3d8_ps_create(const u32 *t, u32 max)
     if (!glsl)
         return 0;
     for (u32 h = 0; h < MAX_PS; h++) {
-        if (!g_ps[h].glsl) {
-            g_ps[h].glsl = glsl;
-            g_ps[h].hash = hash;
+        if (!g_ps[h]) {
+            ps_obj *obj = calloc(1, sizeof *obj);
+            if (!obj) {
+                free(glsl);
+                return 0;
+            }
+            obj->glsl = glsl;
+            obj->hash = hash;
             if (ntok && ntok <= MAX_PS_TOKENS) {
-                g_ps[h].tokens = malloc((size_t)ntok * sizeof(u32));
-                if (g_ps[h].tokens) {
-                    memcpy(g_ps[h].tokens, t, (size_t)ntok * sizeof(u32));
-                    g_ps[h].ntok = ntok;
+                obj->tokens = malloc((size_t)ntok * sizeof(u32));
+                if (obj->tokens) {
+                    memcpy(obj->tokens, t, (size_t)ntok * sizeof(u32));
+                    obj->ntok = ntok;
                 }
             }
+            g_ps[h] = obj;
+            cmd_ps_t cmd = {h, obj};
+            cs_cmd_push(x_ps_set, &cmd, sizeof cmd);
             return h + 1;
         }
     }
@@ -319,24 +353,40 @@ u32 d3d8_ps_create(const u32 *t, u32 max)
 
 void d3d8_ps_delete(u32 h)
 {
-    if (h && h <= MAX_PS) {
-        free(g_ps[h - 1].glsl);
-        free(g_ps[h - 1].tokens);
-        memset(&g_ps[h - 1], 0, sizeof g_ps[h - 1]);
+    if (h && h <= MAX_PS && g_ps[h - 1]) {
+        ps_obj *obj = g_ps[h - 1];
+        g_ps[h - 1] = NULL;
+        cmd_ps_t cmd = {h - 1, obj};
+        cs_cmd_push(x_ps_del, &cmd, sizeof cmd);
     }
 }
 
-const char *d3d8_ps_glsl(u32 h) { return h && h <= MAX_PS ? g_ps[h - 1].glsl : NULL; }
-u64 d3d8_ps_hash(u32 h) { return h && h <= MAX_PS ? g_ps[h - 1].hash : 0; }
+const char *d3d8_ps_glsl(u32 h) { return h && h <= MAX_PS && g_ps[h - 1] ? g_ps[h - 1]->glsl : NULL; }
+u64 d3d8_ps_hash(u32 h) { return h && h <= MAX_PS && g_ps[h - 1] ? g_ps[h - 1]->hash : 0; }
 
 const u32 *d3d8_ps_tokens(u32 h, u32 *out_ntok)
 {
-    if (!h || h > MAX_PS || !g_ps[h - 1].tokens) {
+    if (!h || h > MAX_PS || !g_ps[h - 1] || !g_ps[h - 1]->tokens) {
         if (out_ntok)
             *out_ntok = 0;
         return NULL;
     }
     if (out_ntok)
-        *out_ntok = g_ps[h - 1].ntok;
-    return g_ps[h - 1].tokens;
+        *out_ntok = g_ps[h - 1]->ntok;
+    return g_ps[h - 1]->tokens;
+}
+
+const char *d3d8_r_ps_glsl(u32 h) { return h && h <= MAX_PS && r_ps[h - 1] ? r_ps[h - 1]->glsl : NULL; }
+u64 d3d8_r_ps_hash(u32 h) { return h && h <= MAX_PS && r_ps[h - 1] ? r_ps[h - 1]->hash : 0; }
+
+const u32 *d3d8_r_ps_tokens(u32 h, u32 *out_ntok)
+{
+    if (!h || h > MAX_PS || !r_ps[h - 1] || !r_ps[h - 1]->tokens) {
+        if (out_ntok)
+            *out_ntok = 0;
+        return NULL;
+    }
+    if (out_ntok)
+        *out_ntok = r_ps[h - 1]->ntok;
+    return r_ps[h - 1]->tokens;
 }

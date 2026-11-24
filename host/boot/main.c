@@ -34,6 +34,7 @@
 #include "host/boot/config.h"
 #include "host/boot/input.h"
 #include "host/boot/prof.h"
+#include "platform/platform.h"
 #include "platform/window.h"
 #include "runtime/game/uobj.h"
 #include "runtime/hle/gl_cs.h"
@@ -134,6 +135,7 @@ static void on_trap(CPU *c, u32 addr, const char *what)
     if (!t || (c->esp > t->stack_lo + 64 && c->esp <= t->stack_hi))  // esp мусорный (ловушка вне кода гостя) — без
         flush_guest_logs(c);                                          // вызовов гостя: rt_guest_call кладёт на стек
     hle_file_flush_all();
+    rt_platform_cpu_boost_reset();
 #ifdef SNX_PGO_GEN
     pgo_dump();  // счётчики — в памяти хоста: прогон до ловушки не пропадает
 #endif
@@ -349,7 +351,8 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx)
     u64 far = ctx->far.x;
     GuestThread *t = rt_thread_current();
     char what[160];
-    if (t && far >= (u64)(uintptr_t)g_mem && far < (u64)(uintptr_t)g_mem + 0x100000000ull) {
+    // На Switch окно гостя — RT_WINDOW (1 ГБ), дальше идёт куча хоста: не принимать её сбои за гостевой AV
+    if (t && far >= (u64)(uintptr_t)g_mem && far < (u64)(uintptr_t)g_mem + (u64)RT_WINDOW) {
 #ifdef SNX_PIN
         // регистры гостя закреплены за x19–x26 (runtime/gen_rt.h): в отчёте — из контекста исключения
         t->cpu.eax = (u32)ctx->cpu_gprs[19].x, t->cpu.ecx = (u32)ctx->cpu_gprs[20].x;
@@ -470,6 +473,7 @@ static void boot_shutdown(void)
     cs_stop();
     openal_shutdown();
     hle_file_flush_all();
+    rt_platform_cpu_boost_reset();
     prof_dump();
 #ifdef SNX_PGO_GEN
     pgo_dump();
@@ -672,6 +676,7 @@ int main(int argc, char **argv)
             atomic_store(&g_shutdown_done, 1);
             openal_shutdown();
             hle_file_flush_all();
+            rt_platform_cpu_boost_reset();
             prof_dump();
 #ifdef SNX_PGO_GEN
             pgo_dump();

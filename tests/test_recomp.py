@@ -412,6 +412,7 @@ class TestEmit(unittest.TestCase):
         ctx = gen.Ctx(prog)
 
         old = os.environ.pop("SNX_FPU_SINGLE", None)
+        old_f32 = os.environ.pop("SNX_FPU_FLOAT32", None)
         try:
             code_double = emit.FuncCompiler(mod, f, ctx).compile()
             self.assertNotIn("(double)(float)", code_double)
@@ -431,6 +432,278 @@ class TestEmit(unittest.TestCase):
                 os.environ.pop("SNX_FPU_SINGLE", None)
             else:
                 os.environ["SNX_FPU_SINGLE"] = old
+            if old_f32 is None:
+                os.environ.pop("SNX_FPU_FLOAT32", None)
+            else:
+                os.environ["SNX_FPU_FLOAT32"] = old_f32
+
+    def test_snx_fpu_float32_option(self):
+        # Чистая f32-функция: fld dword [eax]; fadd dword [ecx]; fsqrt; fstp dword [edx]; ret
+        code = bytes.fromhex("d900 d801 d9fa d91a c3")
+        prog, mod = make_program(code)
+        mod.run()
+        f = mod.functions[0x10101000]
+        ctx = gen.Ctx(prog)
+
+        old_s = os.environ.pop("SNX_FPU_SINGLE", None)
+        old_f = os.environ.pop("SNX_FPU_FLOAT32", None)
+        try:
+            # По умолчанию выключено (совместимость с difftest PC=53)
+            c_def = emit.FuncCompiler(mod, f, ctx).compile()
+            self.assertIn("double f0 = 0;", c_def)
+            self.assertIn("sqrt(f0)", c_def)
+
+            # При SNX_FPU_FLOAT32=1 — нативный float без (double)/(float) кастов
+            os.environ["SNX_FPU_FLOAT32"] = "1"
+            c_f32 = emit.FuncCompiler(mod, f, ctx).compile()
+            self.assertIn("float f0 = 0;", c_f32)
+            self.assertIn("f0 = ldf32(m + eax);", c_f32)
+            self.assertIn("f0 = f0 + ldf32(m + ecx);", c_f32)
+            self.assertIn("f0 = sqrtf(f0);", c_f32)
+            self.assertIn("stf32(m + edx, f0);", c_f32)
+            self.assertNotIn("(double)ldf32", c_f32)
+
+            # SNX_FPU_SINGLE=1 перекрывает SNX_FPU_FLOAT32=1
+            os.environ["SNX_FPU_SINGLE"] = "1"
+            c_sing = emit.FuncCompiler(mod, f, ctx).compile()
+            self.assertIn("double f0 = 0;", c_sing)
+            os.environ.pop("SNX_FPU_SINGLE", None)
+
+            # Наличие f64 (fld qword [eax]) -> остаётся double
+            prog_d, mod_d = make_program(bytes.fromhex("dd00 d91a c3"))
+            mod_d.run()
+            c_d = emit.FuncCompiler(mod_d, mod_d.functions[0x10101000], gen.Ctx(prog_d)).compile()
+            self.assertIn("double f0 = 0;", c_d)
+
+            # Наличие libm (fsin) -> остаётся double
+            prog_t, mod_t = make_program(bytes.fromhex("d900 d9fe d91a c3"))
+            mod_t.run()
+            c_t = emit.FuncCompiler(mod_t, mod_t.functions[0x10101000], gen.Ctx(prog_t)).compile()
+            self.assertIn("double f0 = 0;", c_t)
+
+            # Модуль msvcr70.dll -> всегда double
+            prog_crt, mod_crt = make_program(code, base=0x13000000, name="msvcr70.dll")
+            mod_crt.run()
+            c_crt = emit.FuncCompiler(mod_crt, mod_crt.functions[0x13001000], gen.Ctx(prog_crt)).compile()
+            self.assertIn("double f0 = 0;", c_crt)
+
+            # Граница вызовов: callee возвращает float в ST0 -> (double)f0; caller читает -> (float)c->st_ret
+            # 0x10101000: call +5 (0x1010100a); fadd dword [ecx]; fstp dword [edx]; ret
+            # 0x1010100a: fld dword [eax]; ret
+            pair = bytes.fromhex("e805000000 d801 d91a c3 d900 c3")
+            prog_p, mod_p = make_program(pair)
+            mod_p.run()
+            ctx_p = gen.Ctx(prog_p)
+            gen.compute_summaries(ctx_p)
+            c_caller = emit.FuncCompiler(mod_p, mod_p.functions[0x10101000], ctx_p).compile()
+            c_callee = emit.FuncCompiler(mod_p, mod_p.functions[0x1010100a], ctx_p).compile()
+            self.assertIn("float f0 = 0;", c_caller)
+            self.assertIn("f0 = (float)c->st_ret;", c_caller)
+            self.assertIn("float f0 = 0;", c_callee)
+            self.assertIn("c->st_ret = (double)f0;", c_callee)
+        finally:
+            if old_s is None:
+                os.environ.pop("SNX_FPU_SINGLE", None)
+            else:
+                os.environ["SNX_FPU_SINGLE"] = old_s
+            if old_f is None:
+                os.environ.pop("SNX_FPU_FLOAT32", None)
+            else:
+                os.environ["SNX_FPU_FLOAT32"] = old_f
+
+    def test_x87_compare_fusion(self):
+        # 1) Математическая проверка всех 10 реальных (test ah, imm, cc) + sahf + fcomi на IEEE-754 (включая NaN и -0.0)
+        def eval_c_expr(expr, fx, fy):
+            env = {"fx": fx, "fy": fy, "__builtin_isunordered": lambda a, b: (a != a) or (b != b)}
+            py = expr.replace("&&", " and ").replace("||", " or ").replace("!", " not ")
+            py = py.replace(" not =", "!=")
+            return bool(eval(py, {"__builtins__": {}}, env))
+
+        def x87_fcom_ah(x, y):
+            if x != x or y != y:
+                return 0x45
+            if x < y:
+                return 0x01
+            if x == y:
+                return 0x40
+            return 0x00
+
+        samples = [(1.0, 2.0), (2.0, 1.0), (1.0, 1.0), (-0.0, 0.0), (float("nan"), 1.0), (1.0, float("nan")),
+                   (float("nan"), float("nan"))]
+        for mask, cc in [(0x05, "p"), (0x41, "ne"), (0x41, "p"), (0x44, "p"), (0x01, "ne"),
+                         (0x05, "np"), (0x44, "np"), (0x41, "e"), (0x01, "e"), (0x41, "np")]:
+            expr = emit._x87_test_cond(mask, cc)
+            self.assertIsNotNone(expr)
+            for fx, fy in samples:
+                v = x87_fcom_ah(fx, fy) & mask
+                want = emit._eval_cc(cc, 0, int(bin(v).count("1") % 2 == 0), int(v == 0), 0, 0)
+                self.assertEqual(eval_c_expr(expr, fx, fy), want, f"test ah,{mask:#x}/{cc} @ ({fx},{fy}): {expr}")
+
+        for cc in ("p", "np", "e", "ne", "b", "ae", "a", "be"):
+            expr = emit._x87_sahf_cond(cc, allow_of=True)
+            self.assertIsNotNone(expr)
+            for fx, fy in samples:
+                ah = x87_fcom_ah(fx, fy)
+                want = emit._eval_cc(cc, ah & 1, (ah >> 2) & 1, (ah >> 6) & 1, 0, 0)
+                self.assertEqual(eval_c_expr(expr, fx, fy), want, f"sahf/fcomi {cc} @ ({fx},{fy}): {expr}")
+
+        # 2) ax мёртв на обеих ветках (jne перепрыгивает nop прямо на xor eax, eax; ret) -> убраны fnstsw ax, FCOM, PARITY
+        # fld dword [eax]; fcomp dword [ecx]; fnstsw ax; test ah, 0x41; jne +1; nop; xor eax, eax; ret
+        c_dead = bytes.fromhex("d900 d819 dfe0 f6c441 7501 90 31c0 c3")
+        prog, mod = make_program(c_dead)
+        mod.run()
+        out = emit.FuncCompiler(mod, mod.functions[0x10101000], gen.Ctx(prog)).compile()
+        self.assertIn("fx = f0; fy = (double)ldf32(m + ecx);", out)
+        self.assertIn("if ((!(fx > fy))) goto L_1010100c;", out)
+        self.assertNotIn("FCOM(", out)
+        self.assertNotIn("PARITY(", out)
+        self.assertNotIn("fsw", out)
+
+        # 3) ax жив на ветке jne -> ret -> fnstsw ax и FCOM сохранены, но test ah/PARITY убраны
+        # fld dword [eax]; fcomp dword [ecx]; fnstsw ax; test ah, 0x41; jne +2; xor eax, eax; ret
+        c_live = bytes.fromhex("d900 d819 dfe0 f6c441 7502 31c0 c3")
+        prog, mod = make_program(c_live)
+        mod.run()
+        out = emit.FuncCompiler(mod, mod.functions[0x10101000], gen.Ctx(prog)).compile()
+        self.assertIn("fsw = FCOM(fx, fy);", out)
+        self.assertIn("if ((!(fx > fy))) goto L_1010100d;", out)
+        self.assertNotIn("PARITY(", out)
+
+        # 4) Промежуточный fstp st(0) между fnstsw ax и test ah допускается и сливается (ftst)
+        # fld dword [eax]; ftst; fnstsw ax; fstp st(0); test ah, 0x44; jnp +1; nop; xor eax, eax; ret
+        c_ftst = bytes.fromhex("d900 d9e4 dfe0 ddd8 f6c444 7b01 90 31c0 c3")
+        prog, mod = make_program(c_ftst)
+        mod.run()
+        out = emit.FuncCompiler(mod, mod.functions[0x10101000], gen.Ctx(prog)).compile()
+        self.assertIn("fx = f0; fy = 0.0;", out)
+        self.assertIn("if ((fx == fy)) goto L_1010100e;", out)
+        self.assertNotIn("FCOM(", out)
+        self.assertNotIn("PARITY(", out)
+
+        # 5) Промежуточный второй fcomp между fnstsw ax и test ah ЗАПРЕЩАЕТ слияние
+        # fld dword [eax]; fld dword [eax]; fcomp dword [ecx]; fnstsw ax; fcomp dword [edx]; test ah, 0x41; jne +1; nop; xor eax, eax; ret
+        c_inter = bytes.fromhex("d900 d900 d819 dfe0 d81a f6c441 7501 90 31c0 c3")
+        prog, mod = make_program(c_inter)
+        mod.run()
+        fc_inter = emit.FuncCompiler(mod, mod.functions[0x10101000], gen.Ctx(prog))
+        out_inter = fc_inter.compile()
+        self.assertEqual(fc_inter.x87_fused_cmp, {})
+        self.assertIn("FCOM(", out_inter)
+
+        # 6) sahf и fcomip сливаются в прямые сравнения без материализации флагов
+        # fld dword [eax]; fcomp dword [ecx]; fnstsw ax; sahf; jae +1; nop; xor eax, eax; ret
+        c_sahf = bytes.fromhex("d900 d819 dfe0 9e 7301 90 31c0 c3")
+        prog, mod = make_program(c_sahf)
+        mod.run()
+        out_s = emit.FuncCompiler(mod, mod.functions[0x10101000], gen.Ctx(prog)).compile()
+        self.assertIn("if ((fx >= fy)) goto L_1010100a;", out_s)
+        self.assertNotIn("FCOM(", out_s)
+
+        # fld dword [eax]; fld dword [ecx]; fcomip st(0), st(1); fstp st(0); jb +1; nop; xor eax, eax; ret
+        c_comi = bytes.fromhex("d900 d901 dff1 ddd8 7201 90 31c0 c3")
+        prog, mod = make_program(c_comi)
+        mod.run()
+        out_ci = emit.FuncCompiler(mod, mod.functions[0x10101000], gen.Ctx(prog)).compile()
+        self.assertIn("fx = f1; fy = f0;", out_ci)
+        self.assertIn("if ((!(fx >= fy))) goto L_1010100b;", out_ci)
+        self.assertNotIn("cf =", out_ci)
+
+        # 7) Цепочка из двух подряд fcomp; fnstsw ax; test ah; jcc: второй fnstsw ax убивает ax первого!
+        # fld [ebx]; fcomp [ecx]; fnstsw ax; test ah, 0x41; jne +1; nop;
+        # fld [ebx]; fcomp [edx]; fnstsw ax; test ah, 0x41; jne +1; nop; xor eax, eax; ret
+        c_chain = bytes.fromhex("d903 d819 dfe0 f6c441 7501 90 d903 d81a dfe0 f6c441 7501 90 31c0 c3")
+        prog, mod = make_program(c_chain)
+        mod.run()
+        out_ch = emit.FuncCompiler(mod, mod.functions[0x10101000], gen.Ctx(prog)).compile()
+        self.assertNotIn("FCOM(", out_ch)
+        self.assertNotIn("fsw", out_ch)
+
+    def test_gnatives_call_dispatch(self):
+        # Проверяем динамический поиск GNatives из Core.dll (как EN 0x1021b780, так и RUS 0x1021b7d0)
+        for gn_base in (0x1021b780, 0x1021b7d0):
+            # call dword ptr [esi*4 + gn_base]
+            # call dword ptr [eax*4 + gn_base + 0x400] (расширенная страница +256)
+            # call dword ptr [esi*4 + 0x10200000] (не GNatives -> обычный RT_ICALL)
+            # ret
+            code = (
+                b"\xff\x14\xb5" + struct.pack("<I", gn_base)
+                + b"\xff\x14\x85" + struct.pack("<I", gn_base + 0x400)
+                + b"\xff\x14\xb5" + struct.pack("<I", 0x10200000)
+                + b"\xc3"
+            )
+            prog, mod = make_program(
+                code, base=0x10100000, name="Core.dll",
+                exports={"?GNatives@@3PAP8UObject@@AEXAAUFFrame@@QAX@ZA": gn_base},
+            )
+            mod.run()
+            ctx = gen.Ctx(prog)
+            self.assertEqual(ctx.gnatives_base, gn_base)
+            out = emit.FuncCompiler(mod, mod.functions[0x10101000], ctx).compile()
+            self.assertIn("u32 gi_ = esi;", out)
+            self.assertIn("u32 gi_ = (u32)(eax + 256u);", out)
+            self.assertEqual(out.count("RT_GNATIVE_CALL(c, gi_, t);"), 2)
+            self.assertEqual(out.count("RT_ICALL(c, t);"), 1)
+
+    def test_pin_c_param_and_inline_rdtsc(self):
+        # Проверяем: SNX_C_PARAM / SNX_C_ARG / P_(CPU *restrict c = g_pin_c;), вызов гостя (SNX_C_ARG) vs
+        # оверрайда (c), встраивание fi_*(SNX_C_PARAM), таблицу SNX_GUEST_FN и RT_RDTSC().
+        # 0x10101000: rdtsc; call 0x1010100e (листовая -> fi_); call 0x10101012 (оверрайд -> (c)); ret
+        # 0x1010100e: add eax, 1; ret
+        # 0x10101012: xor eax, eax; ret (заменяется оверрайдом)
+        # 0x10101015: jmp 0x1010101a (хвостовой переход на _setjmp3 -> f_1010101a(SNX_C_ARG))
+        # 0x1010101a: xor eax, eax; ret (экспорт _setjmp3)
+        code = bytes.fromhex(
+            "0f31 "                # 1000: rdtsc
+            "e807000000 "          # 1002: call 100e (5 байт, next=1007 -> +7 = 100e)
+            "e806000000 "          # 1007: call 1012 (next=100c -> +6 = 1012)
+            "c3 "                  # 100c: ret
+            "90 "                  # 100d: nop
+            "83c001 c3 "           # 100e: add eax, 1; ret
+            "31c0 c3 "             # 1012: xor eax, eax; ret
+            "e900000000 "          # 1015: jmp 101a (хвостовой переход на _setjmp3)
+            + "90" * 33 + "31c0 c3"  # 101a: > INLINE_MAX инструкций (_setjmp3, не инлайнится)
+        )
+        pe_bytes = make_minimal_pe([(".text", code, image.IMAGE_SCN_MEM_EXECUTE | image.IMAGE_SCN_CNT_CODE)],
+                                   image_base=0x10100000, entry_rva=0x1000, is_dll=True)
+        with tempfile.TemporaryDirectory() as td:
+            pe_path = os.path.join(td, "synth.dll")
+            with open(pe_path, "wb") as f:
+                f.write(pe_bytes)
+            img = image.load_image(pe_path, 0x10100000)
+            img.exports["_setjmp3"] = 0x1010101a
+            prog = discover.Program({"synth.dll": img})
+            mod = discover.Module(img, prog)
+            prog.modules["synth.dll"] = mod
+            mod.strong.update({0x10101000, 0x1010100e, 0x10101012, 0x10101015, 0x1010101a})
+            mod.run()
+            ctx = gen.Ctx(prog, overrides={0x10101012: ("ovr_synth_test", 0)}, wraps={0x10101012: "ovr_synth_test"})
+            outdir = os.path.join(td, "out")
+            gen.write_modules(ctx, [mod], outdir, jobs=1, log=lambda *_: None)
+            with open(os.path.join(outdir, "synth", "synth_0000.c")) as f:
+                chunk = f.read()
+            with open(os.path.join(outdir, "synth", "synth_table.c")) as f:
+                table = f.read()
+            self.assertIn("void f_10101000(SNX_C_PARAM)", chunk)
+            self.assertIn("P_(CPU *restrict c = g_pin_c;)", chunk)
+            self.assertIn("u64 t = RT_RDTSC();", chunk)
+            self.assertIn("fi_1010100e(SNX_C_ARG);", chunk)
+            self.assertIn("f_1010101a(SNX_C_ARG); return;", chunk)
+            self.assertNotIn("f_1010101a(c)", chunk)
+            self.assertIn("ovr_synth_test(c);", chunk)
+            self.assertIn("void ovr_synth_test(CPU *c);", chunk)
+            self.assertIn("fi_1010100e(SNX_C_PARAM)", chunk)
+            self.assertIn("void (*const ovr_orig_ovr_synth_test)(CPU *c) = SNX_GUEST_FN(f_10101012);", table)
+            self.assertIn("{0x10101000u, SNX_GUEST_FN(f_10101000)},", table)
+            self.assertIn("{0x10101012u, ovr_synth_test, 1},", table)
+            # Синтаксическая проверка сгенерированного чанка и таблицы реальным хостовым cc (без SNX_PIN)
+            res = subprocess.run(
+                ["cc", "-std=c11", "-fsyntax-only", "-Wall", "-Wextra", "-Wno-unused-label",
+                 "-Wno-unused-variable", "-Wno-unused-function", "-I", ROOT,
+                 os.path.join(outdir, "synth", "synth_0000.c"),
+                 os.path.join(outdir, "synth", "synth_table.c")],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(res.returncode, 0, f"ошибка синтаксиса C:\n{res.stderr}")
 
     def test_no_address_of_guest_regs(self):
         # Набор инструкций, ранее/потенциально передающих регистры в хелперы:

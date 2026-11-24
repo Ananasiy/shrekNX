@@ -77,25 +77,28 @@ static const char *const g_hk_flag_name[HK_N] = {"bWasHitInThisAttack", "bWasHit
                                                  "bSHPropsStaticWasHitInThisAttack"};
 #define HIT_RADIUS 600.0f  // UU: дальность удара героя с запасом (HitSomebody: радиус + AttackDist + 200)
 #define MAX_TGT 1024
-#define SCAN_STEP 2048u    // объектов GObjObjects за кадр: полный круг по ~100 тыс. объектов — меньше 1 с
+#define SCAN_STEP 512u     // объектов за один фоновый шаг по переиспользованным слотам GObjObjects
+#define SCAN_PERIOD 8u     // фоновый обход переиспользованных слотов раз в 8 кадров (степень двойки)
+#define KIND_CACHE_N 2048u // кеш «класс -> тип цели» (степень двойки, мультипликативный хеш)
 typedef struct {
     u32 obj;
     u8 kind, last;
 } hit_tgt;
 static hit_tgt g_tgt[MAX_TGT];
 static int g_ntgt, g_hk_ready;
-static u32 g_hk_cls[HK_N], g_scan_i;
+static u32 g_hk_cls[HK_N], g_scan_i, g_last_count;
 static uo_prop g_hk_flag[HK_N], g_p_loc;
 static struct {
     u32 cls;
     int kind;  // -1 — не цель
-} g_kind_cache[256];
+} g_kind_cache[KIND_CACHE_N];
 static double g_hit_test_at = -1;  // SNX_RUMBLE_HIT_TEST=<с>: взвести флаг ближайшей цели (проверка без драки)
 
 static void hits_reset(void)
 {
     g_ntgt = 0;
     g_scan_i = 0;
+    g_last_count = 0;
     g_hk_ready = 0;
     memset(g_kind_cache, 0, sizeof g_kind_cache);
 }
@@ -118,7 +121,7 @@ static int hits_init(void)
 static int kind_of(u32 o)
 {
     u32 cls = uo_class(o);
-    unsigned h = (cls >> 4) & 255u;
+    unsigned h = (cls * 0x9E3779B1u) >> 21;  // 11 бит -> [0, KIND_CACHE_N)
     if (g_kind_cache[h].cls == cls)
         return g_kind_cache[h].kind;
     int kind = -1;
@@ -146,25 +149,39 @@ static float dist2(u32 a, u32 b)
     return d2;
 }
 
-// Круговой проход GObjObjects по SCAN_STEP объектов: новые цели (заспавненные враги) попадают в список
+static void hits_try_add(u32 o)
+{
+    if (!o || g_ntgt == MAX_TGT)
+        return;
+    int kind = kind_of(o);
+    if (kind < 0)
+        return;
+    for (int i = 0; i < g_ntgt; i++)
+        if (g_tgt[i].obj == o)
+            return;
+    g_tgt[g_ntgt++] = (hit_tgt){o, (u8)kind, (u8)flag_of(o, kind)};
+}
+
+// Новые объекты в хвосте GObjObjects ([g_last_count, n)) подхватываются сразу (без задержки при спавне);
+// фоновый круговой проход по переиспользованным слотам идёт раз в SCAN_PERIOD кадров порциями по SCAN_STEP
 static void hits_scan(void)
 {
     u32 n = uo_count();
+    if (n < g_last_count)
+        g_last_count = 0;
+    if (g_last_count < n) {
+        u32 limit = g_last_count + 2048u;
+        if (limit > n)
+            limit = n;
+        for (; g_last_count < limit; g_last_count++)
+            hits_try_add(uo_at(g_last_count));
+    }
+    if ((g_frames & (SCAN_PERIOD - 1u)) != 0)
+        return;
     if (g_scan_i >= n)
         g_scan_i = 0;
-    for (u32 end = g_scan_i + SCAN_STEP; g_scan_i < n && g_scan_i < end; g_scan_i++) {
-        u32 o = uo_at(g_scan_i);
-        if (!o || g_ntgt == MAX_TGT)
-            continue;
-        int kind = kind_of(o);
-        if (kind < 0)
-            continue;
-        int dup = 0;
-        for (int i = 0; i < g_ntgt && !dup; i++)
-            dup = g_tgt[i].obj == o;
-        if (!dup)
-            g_tgt[g_ntgt++] = (hit_tgt){o, (u8)kind, (u8)flag_of(o, kind)};
-    }
+    for (u32 end = g_scan_i + SCAN_STEP; g_scan_i < n && g_scan_i < end; g_scan_i++)
+        hits_try_add(uo_at(g_scan_i));
 }
 
 static void hits_frame(u32 pawn)
