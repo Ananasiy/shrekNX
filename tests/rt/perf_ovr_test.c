@@ -923,13 +923,47 @@ int d3d8_direct_shadow_blur(struct d3ddev *d, u32 src_tex_guest, u32 dst_surf_gu
 }
 
 // --- тесты D3DDrv: __ehvec_ctor, SetMaterialPass, CommitState --------------------
+#ifdef SNX_PIN
+// В сборке с SNX_PIN (linux-arm64 / Switch) оверрайды вызывают ovr_orig_* через rt_pin_enter (runtime/rt.c),
+// который грузит w19..w26 из CPU *c перед вызовом и записывает w19..w26 обратно в CPU *c после возврата.
+// Обычный C-мок меняет поля c->esp/c->eax в памяти и сохраняет старые w19..w26, поэтому нужен переходник.
+#define DEFINE_PIN_MOCK(pin_fn, body_fn)                                                                              \
+    extern void pin_fn(CPU *c);                                                                                       \
+    __asm__(".text\n"                                                                                                 \
+            ".global " #pin_fn "\n"                                                                                   \
+            ".type " #pin_fn ", %function\n"                                                                          \
+            ".p2align 2\n"                                                                                            \
+            #pin_fn ":\n"                                                                                             \
+            "    stp x29, x30, [sp, #-32]!\n"                                                                         \
+            "    mov x29, sp\n"                                                                                       \
+            "    str x0, [sp, #16]\n"                                                                                 \
+            "    stp w19, w20, [x0]\n"                                                                                \
+            "    stp w21, w22, [x0, #8]\n"                                                                            \
+            "    stp w23, w24, [x0, #16]\n"                                                                           \
+            "    stp w25, w26, [x0, #24]\n"                                                                           \
+            "    bl " #body_fn "\n"                                                                                   \
+            "    ldr x0, [sp, #16]\n"                                                                                 \
+            "    ldp w19, w20, [x0]\n"                                                                                \
+            "    ldp w21, w22, [x0, #8]\n"                                                                            \
+            "    ldp w23, w24, [x0, #16]\n"                                                                           \
+            "    ldp w25, w26, [x0, #24]\n"                                                                           \
+            "    ldp x29, x30, [sp], #32\n"                                                                           \
+            "    ret\n"                                                                                               \
+            ".size " #pin_fn ", .-" #pin_fn "\n")
+#define PIN_MOCK_SYM(pin_fn, body_fn) pin_fn
+#else
+#define DEFINE_PIN_MOCK(pin_fn, body_fn) extern void body_fn(CPU *c)
+#define PIN_MOCK_SYM(pin_fn, body_fn) body_fn
+#endif
+
 static int g_ehvec_orig_calls;
-static void mock_ehvec_orig(CPU *c)
+void mock_ehvec_orig_body(CPU *c)
 {
     g_ehvec_orig_calls++;
     c->esp += 20u;
 }
-void (*const ovr_orig_ovr_d3ddrv_ehvec_ctor)(CPU *c) = mock_ehvec_orig;
+DEFINE_PIN_MOCK(mock_ehvec_orig_pin, mock_ehvec_orig_body);
+void (*const ovr_orig_ovr_d3ddrv_ehvec_ctor)(CPU *c) = PIN_MOCK_SYM(mock_ehvec_orig_pin, mock_ehvec_orig_body);
 
 static void test_d3ddrv_ehvec_ctor(void)
 {
@@ -1091,14 +1125,16 @@ static void test_d3ddrv_material_and_commit(void)
 static int g_draw_tile_orig_calls;
 static u32 g_shadow_blur_mat_va, g_shadow_other_mat_va;
 
-static void mock_draw_tile_orig(CPU *c)
+void mock_draw_tile_orig_body(CPU *c)
 {
     g_draw_tile_orig_calls++;
     c->esp += 0x30u;  // ret 0x2c
 }
-void (*const ovr_orig_ovr_engine_shadow_draw_tile)(CPU *c) = mock_draw_tile_orig;
+DEFINE_PIN_MOCK(mock_draw_tile_orig_pin, mock_draw_tile_orig_body);
+void (*const ovr_orig_ovr_engine_shadow_draw_tile)(CPU *c) =
+    PIN_MOCK_SYM(mock_draw_tile_orig_pin, mock_draw_tile_orig_body);
 
-static void mock_shadow_get_orig(CPU *c)
+void mock_shadow_get_orig_body(CPU *c)
 {
     u32 saved_esp = c->esp;
     // Имитируем 9 вызовов FCanvasUtil::DrawTile для размытия + 1 посторонний DrawTile
@@ -1120,7 +1156,9 @@ static void mock_shadow_get_orig(CPU *c)
     c->eax = c->ecx;
     c->esp = saved_esp + 16u;  // ret 0xc
 }
-void (*const ovr_orig_ovr_engine_shadow_get)(CPU *c) = mock_shadow_get_orig;
+DEFINE_PIN_MOCK(mock_shadow_get_orig_pin, mock_shadow_get_orig_body);
+void (*const ovr_orig_ovr_engine_shadow_get)(CPU *c) =
+    PIN_MOCK_SYM(mock_shadow_get_orig_pin, mock_shadow_get_orig_body);
 
 static void test_shadow_blur_intercept(void)
 {
